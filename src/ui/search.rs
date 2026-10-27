@@ -5,9 +5,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use super::input::TextInput;
+use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
 use crate::api::{ContentRating, Manga, SEARCH_PAGE_SIZE, SearchPage};
 use crate::app::{Action, Settings};
 
@@ -354,17 +355,6 @@ impl SearchScreen {
     }
 }
 
-fn panel(title: &str, focused: bool) -> Block<'_> {
-    let border = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    Block::bordered()
-        .title(title)
-        .border_style(Style::new().fg(border))
-}
-
 fn result_item(manga: &Manga) -> ListItem<'_> {
     let mut title = vec![Span::raw(manga.title.as_str()).bold()];
     if manga.content_rating != ContentRating::Safe {
@@ -385,48 +375,10 @@ fn result_item(manga: &Manga) -> ListItem<'_> {
     ListItem::new(vec![Line::from(title), meta])
 }
 
-fn rating_span(rating: ContentRating) -> Span<'static> {
-    let span = Span::raw(rating.as_str());
-    match rating {
-        ContentRating::Safe => span.green(),
-        ContentRating::Suggestive => span.yellow(),
-        ContentRating::Erotica | ContentRating::Pornographic => span.red(),
-    }
-}
-
-fn join_spans(spans: Vec<Span<'_>>) -> Vec<Span<'_>> {
-    let mut joined = Vec::with_capacity(spans.len() * 2);
-    for (i, span) in spans.into_iter().enumerate() {
-        if i > 0 {
-            joined.push(Span::raw(" · "));
-        }
-        joined.push(span);
-    }
-    joined
-}
-
-fn key_hints<'a>(keys: &[(&'a str, &'a str)]) -> Line<'a> {
-    let mut spans = vec![Span::raw(" ")];
-    for (key, label) in keys {
-        spans.push(Span::raw(*key).cyan().bold());
-        spans.push(Span::raw(format!(" {label}  ")).dark_gray());
-    }
-    Line::from(spans)
-}
-
-/// Descriptions often end with a `---` rule followed by markdown links; those just add noise here.
-fn strip_link_section(description: &str) -> String {
-    description
-        .split("\n---")
-        .next()
-        .unwrap_or(description)
-        .trim_end()
-        .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::buffer_text;
     use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -562,16 +514,5 @@ mod tests {
         let screen_text = buffer_text(&terminal);
         assert!(screen_text.contains("No manga found for “zzz”."));
         assert!(screen_text.contains("Adult titles are hidden"));
-    }
-
-    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
-        let buffer = terminal.backend().buffer();
-        let width = buffer.area.width as usize;
-        buffer
-            .content
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }

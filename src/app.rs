@@ -9,7 +9,8 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
-use crate::api::{Client, Manga, SearchPage};
+use crate::api::{Chapter, ChapterSlot, Client, Manga, SearchPage};
+use crate::ui::manga::MangaScreen;
 use crate::ui::search::{SearchRequest, SearchScreen};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -25,6 +26,15 @@ pub enum Action {
     Search(SearchRequest),
     ToggleAdult,
     OpenManga(Manga),
+    LoadChapters {
+        manga_id: String,
+        language: String,
+    },
+    Download {
+        manga: Manga,
+        chapters: Vec<Chapter>,
+    },
+    Back,
     Quit,
 }
 
@@ -35,6 +45,11 @@ pub enum Message {
         generation: u64,
         result: Result<SearchPage, String>,
     },
+    Chapters {
+        manga_id: String,
+        language: String,
+        result: Result<Vec<ChapterSlot>, String>,
+    },
 }
 
 pub struct App {
@@ -42,6 +57,8 @@ pub struct App {
     tx: UnboundedSender<Message>,
     settings: Settings,
     search: SearchScreen,
+    /// Open on top of the search screen, which keeps its state for when the user goes back.
+    manga: Option<MangaScreen>,
     running: bool,
     tick: usize,
 }
@@ -53,6 +70,7 @@ pub async fn run(terminal: &mut DefaultTerminal, client: Client) -> io::Result<(
         tx,
         settings: Settings::default(),
         search: SearchScreen::default(),
+        manga: None,
         running: true,
         tick: 0,
     };
@@ -70,7 +88,7 @@ pub async fn run(terminal: &mut DefaultTerminal, client: Client) -> io::Result<(
             },
             Some(message) = rx.recv() => app.handle_message(message),
             // Only wake up on a timer while the spinner is visible.
-            _ = ticker.tick(), if app.search.is_loading() => app.tick = app.tick.wrapping_add(1),
+            _ = ticker.tick(), if app.is_loading() => app.tick = app.tick.wrapping_add(1),
         }
     }
     Ok(())
@@ -79,8 +97,16 @@ pub async fn run(terminal: &mut DefaultTerminal, client: Client) -> io::Result<(
 impl App {
     fn render(&mut self, frame: &mut Frame) {
         let spinner = SPINNER[self.tick % SPINNER.len()];
-        self.search
-            .render(frame, frame.area(), &self.settings, spinner);
+        match &mut self.manga {
+            Some(manga) => manga.render(frame, frame.area(), spinner),
+            None => self
+                .search
+                .render(frame, frame.area(), &self.settings, spinner),
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        self.search.is_loading() || self.manga.as_ref().is_some_and(MangaScreen::is_loading)
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -94,7 +120,11 @@ impl App {
             self.running = false;
             return;
         }
-        if let Some(action) = self.search.handle_key(key) {
+        let action = match &mut self.manga {
+            Some(manga) => manga.handle_key(key),
+            None => self.search.handle_key(key),
+        };
+        if let Some(action) = action {
             self.perform(action);
         }
     }
@@ -103,6 +133,15 @@ impl App {
         match message {
             Message::SearchResults { generation, result } => {
                 self.search.on_results(generation, result)
+            }
+            Message::Chapters {
+                manga_id,
+                language,
+                result,
+            } => {
+                if let Some(manga) = &mut self.manga {
+                    manga.on_chapters(&manga_id, language, result);
+                }
             }
         }
     }
@@ -116,10 +155,23 @@ impl App {
                     self.perform(action);
                 }
             }
-            Action::OpenManga(manga) => self.search.set_notice(format!(
-                "“{}”: the manga screen isn't built yet",
-                manga.title
-            )),
+            Action::OpenManga(manga) => {
+                let (screen, action) = MangaScreen::new(manga);
+                self.manga = Some(screen);
+                if let Some(action) = action {
+                    self.perform(action);
+                }
+            }
+            Action::LoadChapters { manga_id, language } => self.spawn_chapters(manga_id, language),
+            Action::Download { chapters, .. } => {
+                if let Some(manga) = &mut self.manga {
+                    manga.set_notice(format!(
+                        "{} chapters selected; downloading isn't built yet",
+                        chapters.len()
+                    ));
+                }
+            }
+            Action::Back => self.manga = None,
             Action::Quit => self.running = false,
         }
     }
@@ -135,6 +187,22 @@ impl App {
                 .map_err(|err| err.to_string());
             let _ = tx.send(Message::SearchResults {
                 generation: request.generation,
+                result,
+            });
+        });
+    }
+
+    fn spawn_chapters(&self, manga_id: String, language: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .chapters(&manga_id, &language)
+                .await
+                .map_err(|err| err.to_string());
+            let _ = tx.send(Message::Chapters {
+                manga_id,
+                language,
                 result,
             });
         });
