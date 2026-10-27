@@ -3,7 +3,9 @@
 pub mod download_dialog;
 pub mod downloads;
 pub mod input;
+pub mod library;
 pub mod manga;
+pub mod reader;
 pub mod search;
 
 use std::path::Path;

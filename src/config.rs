@@ -157,7 +157,7 @@ fn set(doc: &mut DocumentMut, key: &str, mut value: Value) {
 }
 
 /// Writes to a temporary file first so a crash never leaves a half-written config.
-fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }

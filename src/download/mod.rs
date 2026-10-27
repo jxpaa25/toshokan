@@ -97,6 +97,15 @@ impl Downloader {
     pub fn manga_dir(&self, manga: &Manga) -> PathBuf {
         self.root.join(files::sanitize(&manga.title))
     }
+
+    /// Where `chapter` was saved, in either format, if it has been downloaded.
+    pub fn existing_path(&self, manga: &Manga, chapter: &Chapter) -> Option<PathBuf> {
+        let dir = self.manga_dir(manga);
+        let stem = files::chapter_stem(chapter);
+        [dir.join(format!("{stem}.cbz")), dir.join(stem)]
+            .into_iter()
+            .find(|path| path.exists())
+    }
 }
 
 async fn worker(

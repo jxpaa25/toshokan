@@ -105,7 +105,7 @@ impl DownloadsScreen {
                     .select((!self.entries.is_empty()).then_some(cursor));
                 return None;
             }
-            KeyCode::Esc | KeyCode::Backspace => return Some(Action::CloseDownloads),
+            KeyCode::Esc | KeyCode::Backspace => return Some(Action::CloseOverlay),
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => return None,
         };
@@ -184,6 +184,7 @@ impl DownloadsScreen {
                 ("r", "retry"),
                 ("R", "retry all"),
                 ("x", "clear finished"),
+                ("F1", "library"),
                 ("Esc", "back"),
                 ("q", "quit"),
             ]),

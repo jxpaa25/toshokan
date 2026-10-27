@@ -102,6 +102,8 @@ pub struct MangaScreen {
     chapter_list: ListState,
     focus: Focus,
     notice: Option<String>,
+    /// Uploads already on disk, by chapter id, and whether they've been read.
+    downloaded: HashMap<String, bool>,
 }
 
 impl MangaScreen {
@@ -125,6 +127,7 @@ impl MangaScreen {
             chapter_list: ListState::default(),
             focus: Focus::Chapters,
             notice: None,
+            downloaded: HashMap::new(),
         };
         let action = screen.choose_language(0);
         (screen, action)
@@ -158,6 +161,22 @@ impl MangaScreen {
             self.chapter_list.select(Some(0));
         }
         self.chapters.insert(language, chapters);
+    }
+
+    pub fn manga(&self) -> &Manga {
+        &self.manga
+    }
+
+    /// Every upload in every loaded language.
+    pub fn uploads(&self) -> impl Iterator<Item = &Chapter> {
+        self.chapters.values().flat_map(|chapters| match chapters {
+            Chapters::Loaded(list) => list.slots.iter().flat_map(|slot| &slot.uploads).collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    pub fn set_downloaded(&mut self, downloaded: HashMap<String, bool>) {
+        self.downloaded = downloaded;
     }
 
     /// Unselects every chapter in the shown language, e.g. after they were queued.
@@ -279,6 +298,20 @@ impl MangaScreen {
                 list.toggle_all();
                 selected
             }
+            KeyCode::Char('o') => {
+                let chapter = list.chosen_upload(selected);
+                if !self.downloaded.contains_key(&chapter.id) {
+                    self.notice = Some(
+                        "This release isn't downloaded yet; select it with Space and press d"
+                            .to_owned(),
+                    );
+                    return None;
+                }
+                return Some(Action::ReadDownloaded {
+                    manga: self.manga.clone(),
+                    chapter: chapter.clone(),
+                });
+            }
             KeyCode::Char('d') => {
                 let chapters = list.selected_uploads();
                 if chapters.is_empty() {
@@ -389,7 +422,7 @@ impl MangaScreen {
         let message = match chapters {
             Some(Chapters::Loaded(list)) if !list.slots.is_empty() => {
                 let items: Vec<ListItem> = (0..list.slots.len())
-                    .map(|index| chapter_item(list, index))
+                    .map(|index| chapter_item(list, index, &self.downloaded))
                     .collect();
                 frame.render_stateful_widget(
                     list_widget(items, block),
@@ -427,6 +460,7 @@ impl MangaScreen {
                     ("↑↓", "move"),
                     ("Enter", "choose"),
                     ("Tab", "chapters"),
+                    ("F1", "library"),
                     ("F3", "downloads"),
                     ("Esc", "back"),
                     ("q", "quit"),
@@ -437,7 +471,9 @@ impl MangaScreen {
                     ("←→", "group"),
                     ("p", "use group everywhere"),
                     ("d", "download"),
+                    ("o", "read"),
                     ("Tab", "languages"),
+                    ("F1", "library"),
                     ("F3", "downloads"),
                     ("Esc", "back"),
                 ],
@@ -458,7 +494,11 @@ fn list_widget<'a>(items: Vec<ListItem<'a>>, block: ratatui::widgets::Block<'a>)
         )
 }
 
-fn chapter_item(list: &ChapterList, index: usize) -> ListItem<'_> {
+fn chapter_item<'a>(
+    list: &'a ChapterList,
+    index: usize,
+    downloaded: &HashMap<String, bool>,
+) -> ListItem<'a> {
     let slot = &list.slots[index];
     let upload = list.chosen_upload(index);
 
@@ -493,6 +533,11 @@ fn chapter_item(list: &ChapterList, index: usize) -> ListItem<'_> {
     }
     let date = upload.publish_at.get(..10).unwrap_or(&upload.publish_at);
     second.push(Span::raw(format!(" · {} pages · {date}", upload.pages)).dark_gray());
+    match downloaded.get(&upload.id) {
+        Some(true) => second.push(" · ✓ read".green()),
+        Some(false) => second.push(" · downloaded".cyan()),
+        None => {}
+    }
 
     ListItem::new(vec![Line::from(first), Line::from(second)])
 }
