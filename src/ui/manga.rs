@@ -161,6 +161,15 @@ impl MangaScreen {
         self.chapters.insert(language, chapters);
     }
 
+    /// Unselects every chapter in the shown language, e.g. after they were queued.
+    pub fn clear_selection(&mut self) {
+        let language = self.language.as_ref();
+        if let Some(Chapters::Loaded(list)) = language.and_then(|code| self.chapters.get_mut(code))
+        {
+            list.selected.fill(false);
+        }
+    }
+
     fn choose_language(&mut self, index: usize) -> Option<Action> {
         let code = self.languages.get(index)?.clone();
         self.language_list.select(Some(index));
@@ -419,6 +428,7 @@ impl MangaScreen {
                     ("↑↓", "move"),
                     ("Enter", "choose"),
                     ("Tab", "chapters"),
+                    ("F3", "downloads"),
                     ("Esc", "back"),
                     ("q", "quit"),
                 ],
@@ -429,6 +439,7 @@ impl MangaScreen {
                     ("p", "use group everywhere"),
                     ("d", "download"),
                     ("Tab", "languages"),
+                    ("F3", "downloads"),
                     ("Esc", "back"),
                 ],
             }),

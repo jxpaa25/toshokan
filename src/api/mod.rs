@@ -156,6 +156,16 @@ impl Client {
         result.map(|(bytes, _)| bytes)
     }
 
+    pub async fn fetch_cover(&self, manga_id: &str, file_name: &str) -> Result<Bytes> {
+        let response = self
+            .http
+            .get(cover_url(manga_id, file_name, None))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response.bytes().await?)
+    }
+
     async fn download_image(&self, url: &str) -> Result<(Bytes, bool)> {
         let response = self.http.get(url).send().await?;
         let status = response.status();

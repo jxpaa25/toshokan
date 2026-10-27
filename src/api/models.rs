@@ -224,6 +224,18 @@ impl From<Entity<ChapterAttributes>> for Chapter {
     }
 }
 
+impl Chapter {
+    /// e.g. "Vol. 1 Ch. 10", "Ch. 386", or "Oneshot".
+    pub fn label(&self) -> String {
+        match (&self.volume, &self.number) {
+            (Some(volume), Some(number)) => format!("Vol. {volume} Ch. {number}"),
+            (None, Some(number)) => format!("Ch. {number}"),
+            (Some(volume), None) => format!("Vol. {volume} Oneshot"),
+            (None, None) => "Oneshot".to_owned(),
+        }
+    }
+}
+
 /// All uploads of one chapter number, so the user can pick which group's release to download.
 #[derive(Debug, Clone)]
 pub struct ChapterSlot {
@@ -280,7 +292,8 @@ pub enum Quality {
 }
 
 impl Quality {
-    fn path_segment(self) -> &'static str {
+    /// The URL path segment MangaDex@Home uses for this quality.
+    pub fn as_str(self) -> &'static str {
         match self {
             Quality::Data => "data",
             Quality::DataSaver => "data-saver",
@@ -331,7 +344,7 @@ impl PageSource {
             format!(
                 "{}/{}/{}/{}",
                 self.base_url,
-                self.quality.path_segment(),
+                self.quality.as_str(),
                 self.hash,
                 file
             )

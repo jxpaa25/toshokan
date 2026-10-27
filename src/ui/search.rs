@@ -338,6 +338,7 @@ impl SearchScreen {
                     ("Enter", "search"),
                     ("Tab", "results"),
                     ("F2", "adult"),
+                    ("F3", "downloads"),
                     ("Ctrl+C", "quit"),
                 ],
                 Focus::Results => &[
@@ -345,6 +346,7 @@ impl SearchScreen {
                     ("Enter", "open"),
                     ("/", "search"),
                     ("F2", "adult"),
+                    ("F3", "downloads"),
                     ("q", "quit"),
                 ],
             };
