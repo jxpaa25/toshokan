@@ -3,6 +3,7 @@
 pub mod download_dialog;
 pub mod downloads;
 pub mod input;
+pub mod kitty;
 pub mod library;
 pub mod manga;
 pub mod reader;

@@ -1,13 +1,15 @@
 //! Event loop: terminal input and API responses go in, screen updates and API requests come out.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{execute, queue};
 use futures_util::StreamExt;
+use ratatui::layout::Rect;
 use ratatui::{DefaultTerminal, Frame};
-use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
@@ -21,7 +23,7 @@ use crate::ui::download_dialog::DownloadDialog;
 use crate::ui::downloads::DownloadsScreen;
 use crate::ui::library::LibraryScreen;
 use crate::ui::manga::MangaScreen;
-use crate::ui::reader::{self, Fit, PageLayout, ReaderScreen, Rendered};
+use crate::ui::reader::{Fit, Graphics, PageLayout, ReaderResult, ReaderScreen};
 use crate::ui::search::{SearchRequest, SearchScreen};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -87,7 +89,8 @@ pub enum Message {
         language: String,
         result: Result<Vec<ChapterSlot>, String>,
     },
-    PageRendered(Box<Rendered>),
+    /// A reader job finished on a worker thread.
+    Reader(Box<ReaderResult>),
 }
 
 /// A full-screen view shown over search and the manga screen, which keep their state.
@@ -105,7 +108,7 @@ pub struct App {
     downloader: Downloader,
     next_job_id: u64,
     reading: ReadingState,
-    picker: Picker,
+    graphics: Graphics,
     search: SearchScreen,
     /// Open on top of the search screen, which keeps its state for when the user goes back.
     manga: Option<MangaScreen>,
@@ -117,19 +120,21 @@ pub struct App {
     reader: Option<ReaderScreen>,
     /// Layout and fit of the last closed reader, so the next one opens the same way.
     reader_preferences: (PageLayout, Fit),
+    /// Escape sequences for the terminal (kitty images), written just before the next frame.
+    terminal_output: Vec<u8>,
     /// Set after a first quit request while downloads are running.
     quit_armed: bool,
     running: bool,
     tick: usize,
 }
 
-/// Runs the app. `picker` must be created before this starts reading terminal events, since
-/// it queries the terminal's graphics support.
+/// Runs the app. `graphics` must be worked out before this starts reading terminal events,
+/// since finding out what the terminal supports means reading its replies.
 pub async fn run(
     terminal: &mut DefaultTerminal,
     client: Client,
     config: Config,
-    picker: Picker,
+    graphics: Graphics,
 ) -> io::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (update_tx, mut updates) = mpsc::unbounded_channel();
@@ -144,7 +149,7 @@ pub async fn run(
         downloader,
         next_job_id: 0,
         reading,
-        picker,
+        graphics,
         search: SearchScreen::default(),
         manga: None,
         library: LibraryScreen::new(root),
@@ -152,6 +157,7 @@ pub async fn run(
         dialog: None,
         reader: None,
         reader_preferences: (PageLayout::default(), Fit::default()),
+        terminal_output: Vec::new(),
         quit_armed: false,
         running: true,
         tick: 0,
@@ -163,9 +169,25 @@ pub async fn run(
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Placeholder cells carry kitty image ids in their colour, so colour output has to be on
+    // while the reader is open even when NO_COLOR asks for none; everywhere else, honour it.
+    let no_color = crossterm::style::Colored::ansi_color_disabled();
     while app.running {
+        if no_color {
+            crossterm::style::force_color_output(app.reader.is_some());
+        }
+        // While reading, image commands and the cells that show them go out as one
+        // synchronized update, so a page never flashes at a stale size or position.
+        let synchronize = app.reader.is_some();
+        if synchronize {
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        }
+        app.write_terminal_output(terminal)?;
         terminal.draw(|frame| app.render(frame))?;
-        app.start_render_jobs();
+        if synchronize {
+            execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+        }
+        app.start_reader_jobs();
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(event)) => app.handle_event(event),
@@ -178,7 +200,11 @@ pub async fn run(
             _ = ticker.tick(), if app.is_busy() => app.tick = app.tick.wrapping_add(1),
         }
     }
-    Ok(())
+    // Free the reader's images in the terminal before leaving.
+    if let Some(mut reader) = app.reader.take() {
+        app.terminal_output.extend(reader.close());
+    }
+    app.write_terminal_output(terminal)
 }
 
 impl App {
@@ -204,16 +230,33 @@ impl App {
         }
     }
 
-    /// Hands page decoding requested by the reader's last render to background threads.
-    fn start_render_jobs(&mut self) {
+    /// Lets the reader update the images the terminal holds for the coming frame, and writes
+    /// that (and anything else queued) to the terminal ahead of the frame that uses it.
+    fn write_terminal_output(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        if let Some(reader) = &mut self.reader {
+            let size = terminal.size()?;
+            reader.prepare_frame(Rect::new(0, 0, size.width, size.height));
+            self.terminal_output.extend(reader.take_output());
+        }
+        if self.terminal_output.is_empty() {
+            return Ok(());
+        }
+        let backend = terminal.backend_mut();
+        backend.write_all(&self.terminal_output)?;
+        backend.flush()?;
+        self.terminal_output.clear();
+        Ok(())
+    }
+
+    /// Hands the reader's slow work (decoding, scaling) to worker threads.
+    fn start_reader_jobs(&mut self) {
         let Some(reader) = &mut self.reader else {
             return;
         };
         for job in reader.take_requests() {
             let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
-                let rendered = reader::render_job(job);
-                let _ = tx.send(Message::PageRendered(Box::new(rendered)));
+                let _ = tx.send(Message::Reader(Box::new(job.run())));
             });
         }
     }
@@ -290,9 +333,10 @@ impl App {
                 }
                 self.refresh_downloaded();
             }
-            Message::PageRendered(rendered) => {
+            Message::Reader(result) => {
+                // With no reader open the result is dropped, which also removes its page file.
                 if let Some(reader) = &mut self.reader {
-                    reader.on_rendered(*rendered);
+                    reader.on_job_done(*result);
                 }
             }
         }
@@ -400,15 +444,12 @@ impl App {
                     Some(reader) => reader.preferences(),
                     None => self.reader_preferences,
                 };
-                let (screen, action) = ReaderScreen::new(
-                    manga,
-                    chapter,
-                    &self.reading,
-                    self.picker.clone(),
-                    layout,
-                    fit,
-                );
-                self.reader = Some(screen);
+                let (screen, action) =
+                    ReaderScreen::new(manga, chapter, &self.reading, &self.graphics, layout, fit);
+                // Opening the next chapter replaces the reader; free the old one's images.
+                if let Some(mut old) = self.reader.replace(screen) {
+                    self.terminal_output.extend(old.close());
+                }
                 if let Some(action) = action {
                     self.perform(action);
                 }
@@ -427,7 +468,8 @@ impl App {
                 self.save_reading();
             }
             Action::CloseReader => {
-                if let Some(reader) = self.reader.take() {
+                if let Some(mut reader) = self.reader.take() {
+                    self.terminal_output.extend(reader.close());
                     self.reader_preferences = reader.preferences();
                     let (manga, chapter) = reader.position();
                     self.library.show_chapter(manga, chapter);

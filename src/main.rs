@@ -1,6 +1,7 @@
 use ratatui_image::picker::Picker;
 use toshokan::api::Client;
 use toshokan::config::Config;
+use toshokan::ui::reader::Graphics;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,7 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::init();
     // Ask the terminal which image protocol it supports before anything else reads input.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let result = toshokan::app::run(&mut terminal, client, config, picker).await;
+    let kitty = toshokan::ui::kitty::detect(&picker);
+    let graphics = Graphics { picker, kitty };
+    let result = toshokan::app::run(&mut terminal, client, config, graphics).await;
     ratatui::restore();
     Ok(result?)
 }

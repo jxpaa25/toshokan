@@ -6,6 +6,7 @@
 //! one-chapter entry of its own.
 
 pub mod pages;
+pub mod prepare;
 pub mod state;
 
 use std::cmp::Ordering;
