@@ -19,13 +19,22 @@ const PAGE_CONCURRENCY: usize = 4;
 /// Each attempt asks MangaDex@Home for a fresh server, since the last one may be failing.
 const ATTEMPTS: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     Cbz,
     Folder,
 }
 
 impl OutputFormat {
+    /// The name used in the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Cbz => "cbz",
+            OutputFormat::Folder => "folder",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             OutputFormat::Cbz => "CBZ archive",
@@ -88,14 +97,6 @@ impl Downloader {
     pub fn manga_dir(&self, manga: &Manga) -> PathBuf {
         self.root.join(files::sanitize(&manga.title))
     }
-}
-
-/// `$TOSHOKAN_DIR` if set, otherwise `~/Manga`.
-pub fn default_root() -> PathBuf {
-    std::env::var_os("TOSHOKAN_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join("Manga")))
-        .unwrap_or_else(|| PathBuf::from("Manga"))
 }
 
 async fn worker(

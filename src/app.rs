@@ -10,31 +10,15 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
 use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage};
-use crate::download::{self, Downloader, Job, OutputFormat};
+use crate::config::Config;
+use crate::download::{Downloader, Job, OutputFormat};
+use crate::ui::display_path;
 use crate::ui::download_dialog::DownloadDialog;
 use crate::ui::downloads::DownloadsScreen;
 use crate::ui::manga::MangaScreen;
 use crate::ui::search::{SearchRequest, SearchScreen};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-#[derive(Debug)]
-pub struct Settings {
-    pub include_adult: bool,
-    /// Preselected in the download dialog; updated to whatever was picked last.
-    pub quality: Quality,
-    pub format: OutputFormat,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            include_adult: false,
-            quality: Quality::Data,
-            format: OutputFormat::Cbz,
-        }
-    }
-}
 
 /// Something a screen wants the app to do.
 #[derive(Debug)]
@@ -81,7 +65,7 @@ pub enum Message {
 pub struct App {
     client: Client,
     tx: UnboundedSender<Message>,
-    settings: Settings,
+    config: Config,
     downloader: Downloader,
     next_job_id: u64,
     search: SearchScreen,
@@ -96,14 +80,15 @@ pub struct App {
     tick: usize,
 }
 
-pub async fn run(terminal: &mut DefaultTerminal, client: Client) -> io::Result<()> {
+pub async fn run(terminal: &mut DefaultTerminal, client: Client, config: Config) -> io::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (update_tx, mut updates) = mpsc::unbounded_channel();
-    let downloader = Downloader::spawn(client.clone(), download::default_root(), update_tx);
+    let root = config.settings.download_root();
+    let downloader = Downloader::spawn(client.clone(), root, update_tx);
     let mut app = App {
         client,
         tx,
-        settings: Settings::default(),
+        config,
         downloads: DownloadsScreen::new(downloader.root()),
         downloader,
         next_job_id: 0,
@@ -145,7 +130,8 @@ impl App {
         } else if let Some(manga) = &mut self.manga {
             manga.render(frame, area, spinner);
         } else {
-            self.search.render(frame, area, &self.settings, spinner);
+            self.search
+                .render(frame, area, &self.config.settings, spinner);
         }
         if let Some(dialog) = &self.dialog {
             dialog.render(frame, area);
@@ -210,13 +196,15 @@ impl App {
         match action {
             Action::Search(request) => self.spawn_search(request),
             Action::ToggleAdult => {
-                self.settings.include_adult = !self.settings.include_adult;
+                let settings = &mut self.config.settings;
+                settings.include_adult = !settings.include_adult;
+                self.save_settings();
                 if let Some(action) = self.search.rerun() {
                     self.perform(action);
                 }
             }
             Action::OpenManga(manga) => {
-                let (screen, action) = MangaScreen::new(manga);
+                let (screen, action) = MangaScreen::new(manga, &self.config.settings.language);
                 self.manga = Some(screen);
                 if let Some(action) = action {
                     self.perform(action);
@@ -228,8 +216,8 @@ impl App {
                 self.dialog = Some(DownloadDialog::new(
                     manga,
                     chapters,
-                    self.settings.quality,
-                    self.settings.format,
+                    self.config.settings.quality,
+                    self.config.settings.format,
                     &destination,
                 ));
             }
@@ -240,8 +228,6 @@ impl App {
                 format,
             } => {
                 self.dialog = None;
-                self.settings.quality = quality;
-                self.settings.format = format;
                 let count = chapters.len();
                 for chapter in chapters {
                     self.next_job_id += 1;
@@ -262,6 +248,13 @@ impl App {
                 self.notify(format!(
                     "Queued {count} chapter{plural} · F3 shows downloads"
                 ));
+                // Remember the choices so the next dialog starts with them.
+                let settings = &mut self.config.settings;
+                if (settings.quality, settings.format) != (quality, format) {
+                    settings.quality = quality;
+                    settings.format = format;
+                    self.save_settings();
+                }
             }
             Action::Enqueue(jobs) => {
                 for job in jobs {
@@ -287,6 +280,13 @@ impl App {
         }
     }
 
+    fn save_settings(&mut self) {
+        if let Err(err) = self.config.save() {
+            let path = display_path(self.config.path());
+            self.notify(format!("Couldn't save settings to {path}: {err}"));
+        }
+    }
+
     /// Shows a one-off message in the footer of whichever screen is visible.
     fn notify(&mut self, notice: String) {
         if self.show_downloads {
@@ -301,7 +301,7 @@ impl App {
     fn spawn_search(&self, request: SearchRequest) {
         let client = self.client.clone();
         let tx = self.tx.clone();
-        let include_adult = self.settings.include_adult;
+        let include_adult = self.config.settings.include_adult;
         tokio::spawn(async move {
             let result = client
                 .search_manga(&request.query, request.offset, include_adult)

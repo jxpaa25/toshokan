@@ -10,7 +10,8 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use super::input::TextInput;
 use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
 use crate::api::{ContentRating, Manga, SEARCH_PAGE_SIZE, SearchPage};
-use crate::app::{Action, Settings};
+use crate::app::Action;
+use crate::config::Settings;
 
 /// MangaDex rejects requests past this many results.
 const RESULT_WINDOW: u32 = 10_000;

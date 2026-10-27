@@ -14,8 +14,6 @@ use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
 use crate::api::{Chapter, ChapterSlot, Manga};
 use crate::app::Action;
 
-/// Shown first in the language list and opened by default when available.
-const PREFERRED_LANGUAGE: &str = "en";
 const HEADER_HEIGHT: u16 = 7;
 const LANGUAGES_WIDTH: u16 = 34;
 
@@ -107,12 +105,13 @@ pub struct MangaScreen {
 }
 
 impl MangaScreen {
-    /// Returns the screen and the request for its default language's chapters.
-    pub fn new(manga: Manga) -> (Self, Option<Action>) {
+    /// Returns the screen and the request for its first language's chapters.
+    /// `preferred_language` is listed and opened first when the manga has it.
+    pub fn new(manga: Manga, preferred_language: &str) -> (Self, Option<Action>) {
         let mut languages = manga.languages.clone();
         languages.sort_by_cached_key(|code| {
             (
-                code != PREFERRED_LANGUAGE,
+                code != preferred_language,
                 language_name(code).to_lowercase(),
             )
         });
@@ -631,7 +630,7 @@ mod tests {
 
     /// Two chapters: "1" by A or B, "2" by B only.
     fn loaded_screen() -> MangaScreen {
-        let (mut screen, _) = MangaScreen::new(manga(&["en"]));
+        let (mut screen, _) = MangaScreen::new(manga(&["en"]), "en");
         let slots = vec![
             slot("1", vec![upload("1a", "A"), upload("1b", "B")]),
             slot("2", vec![upload("2b", "B")]),
@@ -649,7 +648,7 @@ mod tests {
 
     #[test]
     fn opens_english_first_and_caches_languages() {
-        let (mut screen, action) = MangaScreen::new(manga(&["fr", "en", "es-la"]));
+        let (mut screen, action) = MangaScreen::new(manga(&["fr", "en", "es-la"]), "en");
         assert_eq!(screen.languages, ["en", "fr", "es-la"]);
         assert!(
             matches!(action, Some(Action::LoadChapters { ref language, .. }) if language == "en")
@@ -673,7 +672,7 @@ mod tests {
 
     #[test]
     fn ignores_chapters_for_another_manga() {
-        let (mut screen, _) = MangaScreen::new(manga(&["en"]));
+        let (mut screen, _) = MangaScreen::new(manga(&["en"]), "en");
         screen.on_chapters("other", "en".to_owned(), Ok(vec![]));
         assert!(screen.is_loading());
     }
@@ -718,7 +717,7 @@ mod tests {
 
     #[test]
     fn retries_after_a_failure() {
-        let (mut screen, _) = MangaScreen::new(manga(&["en"]));
+        let (mut screen, _) = MangaScreen::new(manga(&["en"]), "en");
         screen.on_chapters("m1", "en".to_owned(), Err("timed out".to_owned()));
         assert!(!screen.is_loading());
         let action = screen.handle_key(key(KeyCode::Char('r')));
