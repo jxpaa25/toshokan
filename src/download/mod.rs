@@ -5,6 +5,9 @@
 
 mod files;
 
+pub use files::{released_by, sanitize};
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +17,7 @@ use tokio::fs;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::api::{Chapter, Client, Manga, Quality};
+use crate::library::link::MangaLink;
 
 const PAGE_CONCURRENCY: usize = 4;
 /// Each attempt asks MangaDex@Home for a fresh server, since the last one may be failing.
@@ -53,6 +57,9 @@ impl OutputFormat {
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: u64,
+    /// The manga folder to save into: [`Downloader::manga_dir`], or the library folder the
+    /// download was started from.
+    pub dir: PathBuf,
     pub manga: Manga,
     pub chapter: Chapter,
     pub quality: Quality,
@@ -77,13 +84,19 @@ pub struct Update {
 pub struct Downloader {
     jobs: UnboundedSender<Job>,
     root: PathBuf,
+    /// Folders linked to a MangaDex manga, by manga id.
+    folders: HashMap<String, PathBuf>,
 }
 
 impl Downloader {
     pub fn spawn(client: Client, root: PathBuf, updates: UnboundedSender<Update>) -> Self {
         let (jobs, queue) = mpsc::unbounded_channel();
-        tokio::spawn(worker(client, root.clone(), queue, updates));
-        Downloader { jobs, root }
+        tokio::spawn(worker(client, queue, updates));
+        Downloader {
+            jobs,
+            root,
+            folders: HashMap::new(),
+        }
     }
 
     pub fn enqueue(&self, job: Job) {
@@ -94,23 +107,33 @@ impl Downloader {
         &self.root
     }
 
+    /// The folder named after the manga's title. When there's none, a folder linked to the
+    /// manga instead, since its title on MangaDex may have changed since it was downloaded.
     pub fn manga_dir(&self, manga: &Manga) -> PathBuf {
-        self.root.join(files::sanitize(&manga.title))
+        let named = self.root.join(files::sanitize(&manga.title));
+        match self.folders.get(&manga.id) {
+            Some(linked) if !named.exists() => linked.clone(),
+            _ => named,
+        }
     }
 
-    /// Where `chapter` was saved, in either format, if it has been downloaded.
-    pub fn existing_path(&self, manga: &Manga, chapter: &Chapter) -> Option<PathBuf> {
-        let dir = self.manga_dir(manga);
-        let stem = files::chapter_stem(chapter);
-        [dir.join(format!("{stem}.cbz")), dir.join(stem)]
-            .into_iter()
-            .find(|path| path.exists())
+    /// Remembers that `dir` holds the manga with this id.
+    pub fn link_folder(&mut self, manga_id: &str, dir: PathBuf) {
+        self.folders.insert(manga_id.to_owned(), dir);
     }
+}
+
+/// Where `chapter` was saved in the manga folder `dir`, in either format, if it has been
+/// downloaded.
+pub fn existing_path(dir: &Path, chapter: &Chapter) -> Option<PathBuf> {
+    let stem = files::chapter_stem(chapter);
+    [dir.join(format!("{stem}.cbz")), dir.join(stem)]
+        .into_iter()
+        .find(|path| path.exists())
 }
 
 async fn worker(
     client: Client,
-    root: PathBuf,
     mut queue: UnboundedReceiver<Job>,
     updates: UnboundedSender<Update>,
 ) {
@@ -121,20 +144,19 @@ async fn worker(
                 event,
             });
         };
-        let event = download(&client, &root, &job, &notify)
+        let event = download(&client, &job, &notify)
             .await
             .unwrap_or_else(Event::Failed);
         notify(event);
     }
 }
 
-async fn download(
-    client: &Client,
-    root: &Path,
-    job: &Job,
-    notify: &impl Fn(Event),
-) -> Result<Event, String> {
-    let manga_dir = root.join(files::sanitize(&job.manga.title));
+async fn download(client: &Client, job: &Job, notify: &impl Fn(Event)) -> Result<Event, String> {
+    let manga_dir = &job.dir;
+    fs::create_dir_all(manga_dir)
+        .await
+        .map_err(|err| format!("couldn't create {}: {err}", manga_dir.display()))?;
+    save_link(manga_dir, job).await;
     let stem = files::chapter_stem(&job.chapter);
     let final_path = match job.format {
         OutputFormat::Cbz => manga_dir.join(format!("{stem}.cbz")),
@@ -148,7 +170,7 @@ async fn download(
     fs::create_dir_all(&page_dir)
         .await
         .map_err(|err| format!("couldn't create {}: {err}", page_dir.display()))?;
-    save_cover(client, &manga_dir, &job.manga).await;
+    save_cover(client, manga_dir, &job.manga).await;
 
     let pages = fetch_pages(client, job, &page_dir, notify).await?;
 
@@ -248,6 +270,17 @@ async fn save_page(client: &Client, url: &str, path: &Path) -> Result<(), String
         .map_err(|err| err.to_string())
 }
 
+/// Records which MangaDex manga the folder holds, so the library can check it for new
+/// chapters. Best effort, like the cover.
+async fn save_link(manga_dir: &Path, job: &Job) {
+    let link = MangaLink {
+        id: job.manga.id.clone(),
+        language: job.chapter.language.clone(),
+    };
+    let dir = manga_dir.to_owned();
+    let _ = tokio::task::spawn_blocking(move || link.save(&dir)).await;
+}
+
 /// Saves the series cover as `cover.<ext>` next to the chapters, which readers like Mihon
 /// and Kavita use as the series thumbnail. Best effort: a missing cover isn't worth failing for.
 async fn save_cover(client: &Client, manga_dir: &Path, manga: &Manga) {
@@ -264,5 +297,37 @@ async fn save_cover(client: &Client, manga_dir: &Path, manga: &Manga) {
     }
     if let Ok(bytes) = client.fetch_cover(&manga.id, file_name).await {
         let _ = fs::write(&path, &bytes).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ContentRating;
+
+    #[tokio::test]
+    async fn keeps_a_linked_manga_in_its_folder() {
+        let (updates, _) = mpsc::unbounded_channel();
+        let library = tempfile::tempdir().unwrap();
+        let root = library.path().to_owned();
+        let mut downloader = Downloader::spawn(Client::new().unwrap(), root.clone(), updates);
+        let manga = Manga {
+            id: "m1".to_owned(),
+            title: "Kimetsu: no Yaiba".to_owned(),
+            description: None,
+            status: None,
+            year: None,
+            content_rating: ContentRating::Safe,
+            languages: vec![],
+            authors: vec![],
+            cover_file: None,
+        };
+        assert_eq!(downloader.manga_dir(&manga), root.join("Kimetsu_ no Yaiba"));
+        // Downloaded back when MangaDex had another title for it.
+        downloader.link_folder("m1", root.join("Demon Slayer"));
+        assert_eq!(downloader.manga_dir(&manga), root.join("Demon Slayer"));
+        // A folder named after the current title still wins, as before folders were linked.
+        std::fs::create_dir(root.join("Kimetsu_ no Yaiba")).unwrap();
+        assert_eq!(downloader.manga_dir(&manga), root.join("Kimetsu_ no Yaiba"));
     }
 }

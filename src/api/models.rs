@@ -28,6 +28,12 @@ pub(crate) struct Collection<T> {
     pub total: u32,
 }
 
+/// The body of a request for one entity, like `GET /manga/{id}`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct EntityResponse<T> {
+    pub data: T,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct Entity<A> {
     pub id: String,
@@ -38,6 +44,7 @@ pub(crate) struct Entity<A> {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct Relationship {
+    pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
     /// Only present for relationship types requested via `includes[]`.
@@ -242,6 +249,23 @@ pub struct ChapterSlot {
     pub volume: Option<String>,
     pub number: Option<String>,
     pub uploads: Vec<Chapter>,
+}
+
+impl ChapterSlot {
+    /// Like [`Chapter::label`], with the volume any upload gave.
+    pub fn label(&self) -> String {
+        match (&self.volume, &self.number) {
+            (Some(volume), Some(number)) => format!("Vol. {volume} Ch. {number}"),
+            (None, Some(number)) => format!("Ch. {number}"),
+            (Some(volume), None) => format!("Vol. {volume} Oneshot"),
+            (None, None) => "Oneshot".to_owned(),
+        }
+    }
+
+    /// The chapter number as a number, when it is one.
+    pub fn numeric(&self) -> Option<f64> {
+        self.number.as_deref()?.parse().ok()
+    }
 }
 
 /// Groups uploads by chapter number and sorts them numerically ("10" after "9.5").

@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
-use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
+use super::{groups_label, join_spans, key_hints, panel, rating_span, strip_link_section};
 use crate::api::{Chapter, ChapterSlot, Manga};
 use crate::app::Action;
 
@@ -507,7 +507,7 @@ fn chapter_item<'a>(
     } else {
         "[ ] ".dark_gray()
     };
-    let mut first = vec![checkbox, Span::raw(chapter_label(slot)).bold()];
+    let mut first = vec![checkbox, Span::raw(slot.label()).bold()];
     // Not every group fills in the title, so fall back to another upload's.
     let title = upload
         .title
@@ -542,21 +542,8 @@ fn chapter_item<'a>(
     ListItem::new(vec![Line::from(first), Line::from(second)])
 }
 
-fn chapter_label(slot: &ChapterSlot) -> String {
-    match (&slot.volume, &slot.number) {
-        (Some(volume), Some(number)) => format!("Vol. {volume} Ch. {number}"),
-        (None, Some(number)) => format!("Ch. {number}"),
-        (Some(volume), None) => format!("Vol. {volume} Oneshot"),
-        (None, None) => "Oneshot".to_owned(),
-    }
-}
-
 fn group_label(upload: &Chapter) -> String {
-    if upload.groups.is_empty() {
-        "No group".to_owned()
-    } else {
-        upload.groups.join(" & ")
-    }
+    groups_label(&upload.groups)
 }
 
 /// English name for a MangaDex language code, or the code itself when unknown.

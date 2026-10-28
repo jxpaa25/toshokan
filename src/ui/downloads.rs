@@ -243,6 +243,7 @@ mod tests {
     fn job(id: u64, number: &str) -> Job {
         Job {
             id,
+            dir: PathBuf::from("/tmp/manga/Berserk"),
             manga: Manga {
                 id: "m1".to_owned(),
                 title: "Berserk".to_owned(),

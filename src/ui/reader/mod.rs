@@ -554,6 +554,8 @@ mod tests {
             key: "Test".to_owned(),
             title: "Test".to_owned(),
             chapters: vec![chapter("A", 5), chapter("B", 2)],
+            dir: None,
+            link: None,
         }
     }
 

@@ -15,7 +15,9 @@ use reqwest::header::HeaderMap;
 use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 
-use models::{AtHomeResponse, ChapterAttributes, Collection, Entity, MangaAttributes};
+use models::{
+    AtHomeResponse, ChapterAttributes, Collection, Entity, EntityResponse, MangaAttributes,
+};
 
 const API_BASE: &str = "https://api.mangadex.org";
 const REPORT_URL: &str = "https://api.mangadex.network/report";
@@ -95,6 +97,30 @@ impl Client {
             offset: page.offset,
             total: page.total,
         })
+    }
+
+    pub async fn manga(&self, id: &str) -> Result<Manga> {
+        let query: Query = vec![
+            ("includes[]", "cover_art".to_owned()),
+            ("includes[]", "author".to_owned()),
+            ("includes[]", "artist".to_owned()),
+        ];
+        let response: EntityResponse<Entity<MangaAttributes>> =
+            self.get(&format!("/manga/{id}"), &query).await?;
+        Ok(response.data.into())
+    }
+
+    /// The id of the manga a chapter belongs to.
+    pub async fn manga_of_chapter(&self, chapter_id: &str) -> Result<Option<String>> {
+        let response: EntityResponse<Entity<serde::de::IgnoredAny>> = self
+            .get(&format!("/chapter/{chapter_id}"), &Query::new())
+            .await?;
+        Ok(response
+            .data
+            .relationships
+            .into_iter()
+            .find(|rel| rel.kind == "manga")
+            .map(|rel| rel.id))
     }
 
     /// Every downloadable chapter of a manga in one language, grouped by chapter number.

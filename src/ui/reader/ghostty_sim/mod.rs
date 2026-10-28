@@ -100,6 +100,8 @@ impl Book {
                 key: "Sim".into(),
                 title: "Sim".into(),
                 chapters: locals,
+                dir: None,
+                link: None,
             },
             specs: chapters.to_vec(),
         }

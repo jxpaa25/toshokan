@@ -48,6 +48,15 @@ pub(crate) fn join_spans(spans: Vec<Span<'_>>) -> Vec<Span<'_>> {
     joined
 }
 
+/// e.g. "Band of the Hawks & TAMT", or "No group" for an upload without one.
+pub(crate) fn groups_label(groups: &[String]) -> String {
+    if groups.is_empty() {
+        "No group".to_owned()
+    } else {
+        groups.join(" & ")
+    }
+}
+
 pub(crate) fn key_hints<'a>(keys: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut spans = vec![Span::raw(" ")];
     for (key, label) in keys {

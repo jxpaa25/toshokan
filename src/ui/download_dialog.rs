@@ -1,6 +1,6 @@
 //! Popup asking how to download the chapters selected on the manga screen.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -22,7 +22,10 @@ pub struct DownloadDialog {
     chapters: Vec<Chapter>,
     quality: Quality,
     format: OutputFormat,
-    destination: String,
+    /// The manga folder the chapters are saved in.
+    dir: PathBuf,
+    /// Shown above the keys, e.g. which chapters were left out.
+    note: Option<String>,
 }
 
 impl DownloadDialog {
@@ -32,15 +35,21 @@ impl DownloadDialog {
         chapters: Vec<Chapter>,
         quality: Quality,
         format: OutputFormat,
-        destination: &Path,
+        dir: &Path,
     ) -> Self {
         DownloadDialog {
             manga,
             chapters,
             quality,
             format,
-            destination: display_path(destination),
+            dir: dir.to_owned(),
+            note: None,
         }
+    }
+
+    pub fn with_note(mut self, note: Option<String>) -> Self {
+        self.note = note;
+        self
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -65,6 +74,7 @@ impl DownloadDialog {
                 chapters: std::mem::take(&mut self.chapters),
                 quality: self.quality,
                 format: self.format,
+                dir: self.dir.clone(),
             }),
             KeyCode::Esc | KeyCode::Char('q') => Some(Action::CloseDialog),
             _ => None,
@@ -95,7 +105,7 @@ impl DownloadDialog {
                 note.dark_gray(),
             ])
         };
-        let text = Text::from(vec![
+        let mut lines = vec![
             Line::default(),
             Line::from("  Quality".bold()),
             option(Quality::Data, "Original", "full resolution, 1–3 MB a page"),
@@ -109,16 +119,23 @@ impl DownloadDialog {
             Line::from(vec![
                 "  Save to  ".bold(),
                 // The label and borders take 13 columns.
-                Span::raw(truncate_start(&self.destination, WIDTH as usize - 13)),
+                Span::raw(truncate_start(
+                    &display_path(&self.dir),
+                    WIDTH as usize - 13,
+                )),
             ]),
-            Line::default(),
-            key_hints(&[
-                ("Enter", "start"),
-                ("↑↓", "quality"),
-                ("f", "format"),
-                ("Esc", "cancel"),
-            ]),
-        ]);
+        ];
+        if let Some(note) = &self.note {
+            lines.push(Line::from(format!("  {note}").yellow()));
+        }
+        lines.push(Line::default());
+        lines.push(key_hints(&[
+            ("Enter", "start"),
+            ("↑↓", "quality"),
+            ("f", "format"),
+            ("Esc", "cancel"),
+        ]));
+        let text = Text::from(lines);
         frame.render_widget(Clear, area);
         frame.render_widget(Paragraph::new(text).block(block), area);
     }
@@ -162,13 +179,30 @@ mod tests {
         dialog.handle_key(key(KeyCode::Char('f')));
         match dialog.handle_key(key(KeyCode::Enter)) {
             Some(Action::StartDownload {
-                quality, format, ..
+                quality,
+                format,
+                dir,
+                ..
             }) => {
                 assert_eq!(quality, Quality::DataSaver);
                 assert_eq!(format, OutputFormat::Folder);
+                assert_eq!(dir, Path::new("/tmp/Berserk"));
             }
             other => panic!("expected a download, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shows_a_note() {
+        let dialog = dialog().with_note(Some("Not by A, left out: Ch. 4".to_owned()));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area()))
+            .unwrap();
+        let text = crate::ui::buffer_text(&terminal);
+        assert!(text.contains("Not by A, left out: Ch. 4"));
+        assert!(text.contains("Enter start"), "the keys still fit");
     }
 
     #[test]

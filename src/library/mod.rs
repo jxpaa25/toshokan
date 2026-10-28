@@ -5,14 +5,18 @@
 //! chapters. A `.cbz` or image folder placed directly in the download folder is listed as a
 //! one-chapter entry of its own.
 
+pub mod link;
 pub mod pages;
 pub mod prepare;
 pub mod state;
+pub mod updates;
 
 use std::cmp::Ordering;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use link::MangaLink;
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 
@@ -38,6 +42,9 @@ pub struct LibraryManga {
     pub key: String,
     pub title: String,
     pub chapters: Vec<LocalChapter>,
+    /// The manga's folder; `None` for a loose chapter.
+    pub dir: Option<PathBuf>,
+    pub link: Option<MangaLink>,
 }
 
 /// Everything readable in `root`, sorted by title. A missing folder is an empty library.
@@ -62,6 +69,8 @@ pub fn scan(root: &Path) -> io::Result<Vec<LibraryManga>> {
                 key: chapter.file_name.clone(),
                 title: chapter.name.clone(),
                 chapters: vec![chapter],
+                dir: None,
+                link: None,
             });
         }
     }
@@ -89,12 +98,14 @@ pub fn scan_manga(dir: &Path) -> io::Result<LibraryManga> {
         title: key.clone(),
         key,
         chapters,
+        dir: Some(dir.to_owned()),
+        link: MangaLink::load(dir),
     })
 }
 
 /// The number after "Ch", "Ch." or "Chapter" in any case, e.g. 10.5 in
 /// "Vol. 02 Ch. 0010.5 - Title".
-fn chapter_number(name: &str) -> Option<f64> {
+pub(crate) fn chapter_number(name: &str) -> Option<f64> {
     let lower = name.to_lowercase();
     let mut from = 0;
     while let Some(found) = lower[from..].find("ch") {

@@ -58,6 +58,16 @@ pub fn chapter_stem(chapter: &Chapter) -> String {
     sanitize(&stem)
 }
 
+/// Whether a chapter saved as `name` by [`chapter_stem`] was released by exactly `groups`.
+pub fn released_by(name: &str, groups: &[String]) -> bool {
+    if groups.is_empty() {
+        return false;
+    }
+    let suffix = sanitize(&format!("[{}]", groups.join(" & ")));
+    name.strip_suffix(&suffix)
+        .is_some_and(|rest| rest.ends_with(' '))
+}
+
 fn pad_number(number: &str, width: usize) -> String {
     let (whole, fraction) = match number.split_once('.') {
         Some((whole, fraction)) => (whole, Some(fraction)),
@@ -201,6 +211,17 @@ mod tests {
             chapter_stem(&chapter(None, None, Some("A/B"))),
             "Oneshot - A_B [Band of the Hawks]"
         );
+    }
+
+    #[test]
+    fn tells_which_groups_released_a_saved_chapter() {
+        let name = chapter_stem(&chapter(None, Some("3"), Some("Fate/Zero")));
+        let groups = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(released_by(&name, &groups(&["Band of the Hawks"])));
+        assert!(!released_by(&name, &groups(&["Hawks"])));
+        assert!(!released_by(&name, &groups(&[])));
+        assert!(released_by("Ch. 0001 [A_B & C]", &groups(&["A/B", "C"])));
+        assert!(!released_by("Ch. 0001 [A & C]", &groups(&["C"])));
     }
 
     #[test]

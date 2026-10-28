@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,12 +12,14 @@ use futures_util::StreamExt;
 use ratatui::layout::Rect;
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage};
 use crate::config::Config;
 use crate::download::{self, Downloader, Job, OutputFormat};
 use crate::library::state::{Direction, ReadingState};
+use crate::library::updates::{self, CheckEvent, Outcome};
 use crate::library::{self, LibraryManga};
 use crate::ui::display_path;
 use crate::ui::download_dialog::DownloadDialog;
@@ -48,8 +51,17 @@ pub enum Action {
         chapters: Vec<Chapter>,
         quality: Quality,
         format: OutputFormat,
+        /// The manga folder to save them in.
+        dir: PathBuf,
     },
     Enqueue(Vec<Job>),
+    /// Check the library for chapters released on MangaDex since they were downloaded.
+    CheckForNew,
+    /// Fetch a library manga's details from MangaDex, then do `then` with them.
+    LookUpManga {
+        id: String,
+        then: LookUp,
+    },
     /// Open a chapter from the online manga screen that's already on disk.
     ReadDownloaded {
         manga: Manga,
@@ -77,6 +89,19 @@ pub enum Action {
     Quit,
 }
 
+/// What to do with a library manga once its details arrive from MangaDex.
+#[derive(Debug)]
+pub enum LookUp {
+    /// Ask how to download these new chapters into `dir`; `note` says which were left out.
+    Download {
+        dir: PathBuf,
+        chapters: Vec<Chapter>,
+        note: Option<String>,
+    },
+    /// Show its online manga screen in this language, saving downloads into `dir`.
+    Open { dir: PathBuf, language: String },
+}
+
 /// Results of background work, delivered back to the event loop.
 #[derive(Debug)]
 pub enum Message {
@@ -91,6 +116,14 @@ pub enum Message {
     },
     /// A reader job finished on a worker thread.
     Reader(Box<ReaderResult>),
+    NewChapters {
+        generation: u64,
+        event: CheckEvent,
+    },
+    Manga {
+        result: Result<Manga, String>,
+        then: LookUp,
+    },
 }
 
 /// A full-screen view shown over search and the manga screen, which keep their state.
@@ -112,6 +145,9 @@ pub struct App {
     search: SearchScreen,
     /// Open on top of the search screen, which keeps its state for when the user goes back.
     manga: Option<MangaScreen>,
+    /// The library folder the manga screen was opened from: its downloads go there, and going
+    /// back returns to the library.
+    manga_from_library: Option<PathBuf>,
     downloads: DownloadsScreen,
     library: LibraryScreen,
     overlay: Overlay,
@@ -122,6 +158,11 @@ pub struct App {
     reader_preferences: (PageLayout, Fit),
     /// Escape sequences for the terminal (kitty images), written just before the next frame.
     terminal_output: Vec<u8>,
+    /// The running check for new chapters, and which check is current.
+    check_task: Option<JoinHandle<()>>,
+    check_generation: u64,
+    /// The current check was asked for with u, so "nothing new" is worth saying.
+    check_requested: bool,
     /// Set after a first quit request while downloads are running.
     quit_armed: bool,
     running: bool,
@@ -152,12 +193,16 @@ pub async fn run(
         graphics,
         search: SearchScreen::default(),
         manga: None,
+        manga_from_library: None,
         library: LibraryScreen::new(root),
         overlay: Overlay::None,
         dialog: None,
         reader: None,
         reader_preferences: (PageLayout::default(), Fit::default()),
         terminal_output: Vec::new(),
+        check_task: None,
+        check_generation: 0,
+        check_requested: false,
         quit_armed: false,
         running: true,
         tick: 0,
@@ -165,6 +210,7 @@ pub async fn run(
     if let Some(warning) = warning {
         app.notify(warning);
     }
+    app.check_for_new(false);
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -216,7 +262,7 @@ impl App {
             return;
         }
         match self.overlay {
-            Overlay::Library => self.library.render(frame, area, &self.reading),
+            Overlay::Library => self.library.render(frame, area, &self.reading, spinner),
             Overlay::Downloads => self.downloads.render(frame, area, spinner),
             Overlay::None => match &mut self.manga {
                 Some(manga) => manga.render(frame, area, spinner),
@@ -265,6 +311,7 @@ impl App {
         self.search.is_loading()
             || self.manga.as_ref().is_some_and(MangaScreen::is_loading)
             || self.downloads.active_count() > 0
+            || (self.overlay == Overlay::Library && self.library.is_checking())
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -339,6 +386,86 @@ impl App {
                     reader.on_job_done(*result);
                 }
             }
+            Message::NewChapters { generation, event } => {
+                if generation == self.check_generation {
+                    self.on_check_event(event);
+                }
+            }
+            Message::Manga { result, then } => self.on_looked_up(result, then),
+        }
+    }
+
+    fn on_check_event(&mut self, event: CheckEvent) {
+        match event {
+            CheckEvent::Started { total, links } => {
+                for (id, dir) in links {
+                    self.downloader.link_folder(&id, dir);
+                }
+                self.library.check_started(total);
+                if total == 0 {
+                    self.check_finished();
+                }
+            }
+            CheckEvent::Checked { key, dir, result } => {
+                if let Ok(Outcome::Found(found)) = &result {
+                    self.downloader.link_folder(&found.link.id, dir);
+                }
+                self.library.on_checked(key, result);
+                if !self.library.is_checking() {
+                    self.check_finished();
+                }
+            }
+            CheckEvent::Stopped(reason) => {
+                self.library.check_stopped();
+                self.check_task = None;
+                self.notify(format!("Stopped checking for new chapters: {reason}"));
+            }
+        }
+    }
+
+    fn check_finished(&mut self) {
+        self.check_task = None;
+        // The manga screen may show chapters of a folder that was just linked.
+        self.refresh_downloaded();
+        // Not worth interrupting reading for; the library shows it.
+        if self.reader.is_some() {
+            return;
+        }
+        let count = self.library.with_new_chapters();
+        if count > 0 {
+            let verb = if count == 1 { "has" } else { "have" };
+            let hint = if self.overlay == Overlay::Library {
+                "d downloads them"
+            } else {
+                "F1 shows the library"
+            };
+            self.notify(format!("{count} manga {verb} new chapters · {hint}"));
+        } else if self.check_requested {
+            self.notify("No new chapters on MangaDex".to_owned());
+        }
+    }
+
+    fn on_looked_up(&mut self, result: Result<Manga, String>, then: LookUp) {
+        self.library.clear_notice();
+        // The user may have moved on while it loaded.
+        if self.overlay != Overlay::Library || self.reader.is_some() || self.dialog.is_some() {
+            return;
+        }
+        let manga = match result {
+            Ok(manga) => manga,
+            Err(err) => return self.notify(format!("Couldn't load the manga: {err}")),
+        };
+        match then {
+            LookUp::Download {
+                dir,
+                chapters,
+                note,
+            } => self.open_download_dialog(manga, chapters, Some(dir), note),
+            LookUp::Open { dir, language } => {
+                self.overlay = Overlay::None;
+                self.open_manga(manga, &language);
+                self.manga_from_library = Some(dir);
+            }
         }
     }
 
@@ -347,6 +474,9 @@ impl App {
         self.downloads.on_update(update);
         if finished {
             self.refresh_downloaded();
+            if self.overlay == Overlay::Library {
+                self.library.refresh(&self.reading);
+            }
         }
     }
 
@@ -356,12 +486,15 @@ impl App {
             return;
         };
         let manga = screen.manga();
-        let manga_dir = self.downloader.manga_dir(manga);
+        let manga_dir = match &self.manga_from_library {
+            Some(dir) => dir.clone(),
+            None => self.downloader.manga_dir(manga),
+        };
         let manga_key = file_name(&manga_dir);
         let downloaded: HashMap<String, bool> = screen
             .uploads()
             .filter_map(|chapter| {
-                let path = self.downloader.existing_path(manga, chapter)?;
+                let path = download::existing_path(&manga_dir, chapter)?;
                 let progress = self.reading.progress(&manga_key, &file_name(&path));
                 Some((chapter.id.clone(), progress.is_some_and(|p| p.read)))
             })
@@ -381,28 +514,20 @@ impl App {
                 }
             }
             Action::OpenManga(manga) => {
-                let (screen, action) = MangaScreen::new(manga, &self.config.settings.language);
-                self.manga = Some(screen);
-                if let Some(action) = action {
-                    self.perform(action);
-                }
+                let language = self.config.settings.language.clone();
+                self.open_manga(manga, &language);
             }
             Action::LoadChapters { manga_id, language } => self.spawn_chapters(manga_id, language),
             Action::Download { manga, chapters } => {
-                let destination = self.downloader.manga_dir(&manga);
-                self.dialog = Some(DownloadDialog::new(
-                    manga,
-                    chapters,
-                    self.config.settings.quality,
-                    self.config.settings.format,
-                    &destination,
-                ));
+                let dir = self.manga_from_library.clone();
+                self.open_download_dialog(manga, chapters, dir, None)
             }
             Action::StartDownload {
                 manga,
                 chapters,
                 quality,
                 format,
+                dir,
             } => {
                 self.dialog = None;
                 let count = chapters.len();
@@ -410,6 +535,7 @@ impl App {
                     self.next_job_id += 1;
                     let job = Job {
                         id: self.next_job_id,
+                        dir: dir.clone(),
                         manga: manga.clone(),
                         chapter,
                         quality,
@@ -418,7 +544,9 @@ impl App {
                     self.downloads.add(job.clone());
                     self.downloader.enqueue(job);
                 }
-                if let Some(screen) = &mut self.manga {
+                if self.overlay == Overlay::None
+                    && let Some(screen) = &mut self.manga
+                {
                     screen.clear_selection();
                 }
                 let plural = if count == 1 { "" } else { "s" };
@@ -438,6 +566,8 @@ impl App {
                     self.downloader.enqueue(job);
                 }
             }
+            Action::CheckForNew => self.check_for_new(true),
+            Action::LookUpManga { id, then } => self.spawn_look_up(id, then),
             Action::ReadDownloaded { manga, chapter } => self.read_downloaded(&manga, &chapter),
             Action::OpenReader { manga, chapter } => {
                 let (layout, fit) = match &self.reader {
@@ -478,7 +608,12 @@ impl App {
             }
             Action::CloseDialog => self.dialog = None,
             Action::CloseOverlay => self.overlay = Overlay::None,
-            Action::Back => self.manga = None,
+            Action::Back => {
+                self.manga = None;
+                if self.manga_from_library.take().is_some() {
+                    self.toggle_overlay(Overlay::Library);
+                }
+            }
             Action::Quit => {
                 let active = self.downloads.active_count();
                 if active > 0 && !self.quit_armed {
@@ -495,12 +630,75 @@ impl App {
         }
     }
 
+    fn open_manga(&mut self, manga: Manga, language: &str) {
+        let (screen, action) = MangaScreen::new(manga, language);
+        self.manga = Some(screen);
+        self.manga_from_library = None;
+        if let Some(action) = action {
+            self.perform(action);
+        }
+    }
+
+    /// Asks how to download `chapters` into `dir`, or the manga's usual folder.
+    fn open_download_dialog(
+        &mut self,
+        manga: Manga,
+        chapters: Vec<Chapter>,
+        dir: Option<PathBuf>,
+        note: Option<String>,
+    ) {
+        let dir = dir.unwrap_or_else(|| self.downloader.manga_dir(&manga));
+        let dialog = DownloadDialog::new(
+            manga,
+            chapters,
+            self.config.settings.quality,
+            self.config.settings.format,
+            &dir,
+        );
+        self.dialog = Some(dialog.with_note(note));
+    }
+
+    /// Starts checking the library for new chapters in the background, replacing any check
+    /// still running.
+    fn check_for_new(&mut self, requested: bool) {
+        if let Some(task) = self.check_task.take() {
+            task.abort();
+        }
+        self.check_generation += 1;
+        self.check_requested = requested;
+        let generation = self.check_generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let root = self.downloader.root().to_owned();
+        let language = self.config.settings.language.clone();
+        let include_adult = self.config.settings.include_adult;
+        self.check_task = Some(tokio::spawn(async move {
+            updates::check_library(&client, root, &language, include_adult, |event| {
+                let _ = tx.send(Message::NewChapters { generation, event });
+            })
+            .await;
+        }));
+    }
+
+    fn spawn_look_up(&self, id: String, then: LookUp) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client.manga(&id).await.map_err(|err| err.to_string());
+            let _ = tx.send(Message::Manga { result, then });
+        });
+    }
+
     fn read_downloaded(&mut self, manga: &Manga, chapter: &Chapter) {
-        let Some(path) = self.downloader.existing_path(manga, chapter) else {
+        let dir = match &self.manga_from_library {
+            Some(dir) => dir.clone(),
+            None => self.downloader.manga_dir(manga),
+        };
+        let Some(path) = download::existing_path(&dir, chapter) else {
             self.notify("That chapter isn't on disk anymore".to_owned());
             return;
         };
-        match library::scan_manga(&self.downloader.manga_dir(manga)) {
+        match library::scan_manga(&dir) {
             Ok(local) => match local.chapters.iter().position(|c| c.path == path) {
                 Some(index) => self.perform(Action::OpenReader {
                     manga: local,
