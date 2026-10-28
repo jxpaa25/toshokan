@@ -6,12 +6,13 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::{display_path, groups_label, key_hints, panel, truncate_start};
+use super::cover::{CoverSource, cover_rect};
+use super::{border_style, display_path, groups_label, key_hints, panel, truncate_start};
 use crate::app::{Action, LookUp};
 use crate::library::delete::Deletion;
 use crate::library::state::ReadingState;
@@ -20,6 +21,10 @@ use crate::library::{self, LibraryManga, LocalChapter};
 
 /// Rows of new chapters listed under a manga's chapters before the rest are summed up.
 const NEW_ROWS: usize = 6;
+/// The Library pane shows the selected manga's cover under the list when it's this tall
+/// inside; the cover takes about half, up to `COVER_ROWS`.
+const COVER_PANE_HEIGHT: u16 = 16;
+const COVER_ROWS: u16 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -435,6 +440,15 @@ impl LibraryScreen {
         })
     }
 
+    /// The selected manga's cover, and where the Library pane shows it.
+    pub fn cover(&self, area: Rect) -> Option<(CoverSource, Rect)> {
+        let manga = self.selected_manga()?;
+        let [body, _] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        let [manga_area, _] = panes(body);
+        let (_, cover) = manga_pane_layout(manga_area);
+        Some((CoverSource::local(manga), cover?))
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect, state: &ReadingState, spinner: &str) {
         let [body, footer] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
@@ -471,9 +485,7 @@ impl LibraryScreen {
                 .block(block);
             frame.render_widget(paragraph, body);
         } else {
-            let [manga_area, chapters_area] =
-                Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-                    .areas(body);
+            let [manga_area, chapters_area] = panes(body);
             self.render_manga(frame, manga_area, state, spinner);
             let status = self.check_status();
             let used = 2 + status.as_ref().map_or(0, |status| status.width() + 1);
@@ -584,8 +596,21 @@ impl LibraryScreen {
                 }
             }
         }
-        let block = panel(&title, self.focus == Focus::Manga);
-        frame.render_stateful_widget(list(items, block), area, &mut self.manga_list);
+        let focused = self.focus == Focus::Manga;
+        frame.render_widget(panel(&title, focused), area);
+        let (list_area, cover) = manga_pane_layout(area);
+        frame.render_stateful_widget(
+            list(items, Block::default()),
+            list_area,
+            &mut self.manga_list,
+        );
+        // A line between the list and the cover, which the app draws into the space below.
+        if cover.is_some() {
+            let y = list_area.bottom();
+            let line = format!("├{}┤", "─".repeat(usize::from(list_area.width)));
+            let line = Paragraph::new(line).style(border_style(focused));
+            frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
+        }
     }
 
     fn render_chapters(
@@ -706,6 +731,32 @@ fn render_new(frame: &mut Frame, area: Rect, found: &Found, missing: &[&NewChapt
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The Library pane and the Chapters pane beside it.
+fn panes(body: Rect) -> [Rect; 2] {
+    Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(body)
+}
+
+/// The space for the manga list in the Library pane and, when it's tall enough, for the
+/// selected manga's cover centred under it.
+fn manga_pane_layout(pane: Rect) -> (Rect, Option<Rect>) {
+    let inner = pane.inner(Margin::new(1, 1));
+    if inner.height < COVER_PANE_HEIGHT {
+        return (inner, None);
+    }
+    let rows = (inner.height / 2).saturating_sub(1).min(COVER_ROWS);
+    let list = Rect {
+        height: inner.height - rows - 1,
+        ..inner
+    };
+    let below = Rect {
+        y: list.bottom() + 1,
+        height: rows,
+        ..inner
+    }
+    .inner(Margin::new(1, 0));
+    (list, Some(cover_rect(below, rows, true)))
+}
+
 fn not_found(manga: &LibraryManga) -> String {
     format!(
         "Couldn't find \"{}\" on MangaDex; download a chapter of it from search to link it",
@@ -735,6 +786,7 @@ mod tests {
     use crate::library::link::MangaLink;
     use crate::library::updates;
     use crate::ui::buffer_text;
+    use crate::ui::cover::CoverSource;
     use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -919,6 +971,40 @@ mod tests {
         screen.focus = Focus::Chapters;
         screen.refresh(&state);
         assert_eq!(screen.focus, Focus::Manga);
+    }
+
+    #[test]
+    fn shows_the_selected_manga_cover_under_the_list_when_tall_enough() {
+        let dir = tempfile::tempdir().unwrap();
+        two_manga(dir.path());
+        let (state, _) = ReadingState::load(dir.path().join("state.json"));
+        let mut screen = LibraryScreen::new(dir.path().to_owned());
+        screen.rescan(&state);
+        assert_eq!(screen.cover(Rect::new(0, 0, 100, 16)), None, "too short");
+
+        let area = Rect::new(0, 0, 100, 40);
+        let (source, rect) = screen.cover(area).unwrap();
+        match source {
+            CoverSource::Local {
+                dir: folder,
+                first_chapter,
+                ..
+            } => {
+                assert_eq!(folder, Some(dir.path().join("Akira")));
+                assert_eq!(first_chapter.unwrap().name, "Ch. 0001");
+            }
+            other => panic!("expected a local cover, got {other:?}"),
+        }
+        // 37 rows inside the pane: 19 for the list, a line, then a 17-row cover centred
+        // under it.
+        assert_eq!(rect, Rect::new(8, 21, 24, 17));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), &state, "⠋"))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        let separator = text.lines().nth(20).unwrap();
+        assert!(separator.starts_with("├──────"), "{separator}");
     }
 
     fn upload(id: &str, number: &str, group: &str) -> Chapter {

@@ -1,5 +1,6 @@
 //! Screens and the drawing helpers they share.
 
+pub mod cover;
 pub mod delete_dialog;
 pub mod download_dialog;
 pub mod downloads;
@@ -20,14 +21,19 @@ use ratatui::widgets::Block;
 use crate::api::ContentRating;
 
 pub(crate) fn panel(title: &str, focused: bool) -> Block<'_> {
+    Block::bordered()
+        .title(title)
+        .border_style(border_style(focused))
+}
+
+/// The style of a [`panel`]'s border.
+pub(crate) fn border_style(focused: bool) -> Style {
     let border = if focused {
         Color::Cyan
     } else {
         Color::DarkGray
     };
-    Block::bordered()
-        .title(title)
-        .border_style(Style::new().fg(border))
+    Style::new().fg(border)
 }
 
 pub(crate) fn rating_span(rating: ContentRating) -> Span<'static> {

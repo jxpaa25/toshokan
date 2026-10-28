@@ -9,6 +9,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
 use futures_util::StreamExt;
+use image::RgbImage;
 use ratatui::layout::Rect;
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -22,6 +23,7 @@ use crate::library::delete::{self, Deletion};
 use crate::library::state::{Direction, ReadingState};
 use crate::library::updates::{self, CheckEvent, Outcome};
 use crate::library::{self, LibraryManga};
+use crate::ui::cover::{self, CoverSource, Covers};
 use crate::ui::delete_dialog::DeleteDialog;
 use crate::ui::download_dialog::DownloadDialog;
 use crate::ui::downloads::DownloadsScreen;
@@ -153,6 +155,10 @@ pub enum Message {
         result: Result<(), String>,
     },
     Tags(Result<Vec<Tag>, String>),
+    Cover {
+        source: CoverSource,
+        result: Result<RgbImage, String>,
+    },
 }
 
 /// A popup over the current screen, which gets the keys while it's open.
@@ -179,6 +185,7 @@ pub struct App {
     queue_path: PathBuf,
     reading: ReadingState,
     graphics: Graphics,
+    covers: Covers,
     search: SearchScreen,
     /// Open on top of the search screen, which keeps its state for when the user goes back.
     manga: Option<MangaScreen>,
@@ -226,6 +233,7 @@ pub async fn run(
         next_job_id: 0,
         queue_path: SavedQueue::default_path(),
         reading,
+        covers: Covers::new(graphics.picker.clone(), graphics.kitty.clone()),
         graphics,
         search: SearchScreen::default(),
         manga: None,
@@ -255,12 +263,15 @@ pub async fn run(
     // while the reader is open even when NO_COLOR asks for none; everywhere else, honour it.
     let no_color = crossterm::style::Colored::ansi_color_disabled();
     while app.running {
+        let size = terminal.size()?;
+        app.prepare_frame(Rect::new(0, 0, size.width, size.height));
+        let placeholders = app.reader.is_some() || app.covers.shows_placeholders();
         if no_color {
-            crossterm::style::force_color_output(app.reader.is_some());
+            crossterm::style::force_color_output(placeholders);
         }
-        // While reading, image commands and the cells that show them go out as one
-        // synchronized update, so a page never flashes at a stale size or position.
-        let synchronize = app.reader.is_some();
+        // Image commands and the cells that show them go out as one synchronized update, so
+        // a page or cover never flashes at a stale size or position.
+        let synchronize = placeholders || !app.terminal_output.is_empty();
         if synchronize {
             queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
         }
@@ -270,6 +281,7 @@ pub async fn run(
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
         }
         app.start_reader_jobs();
+        app.start_cover_job();
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(event)) => app.handle_event(event),
@@ -287,6 +299,7 @@ pub async fn run(
         app.terminal_output.extend(reader.close());
         app.terminal_output.extend(MOUSE_OFF);
     }
+    app.terminal_output.extend(app.covers.close());
     app.write_terminal_output(terminal)
 }
 
@@ -308,6 +321,10 @@ impl App {
                     .render(frame, area, &self.config.settings, spinner),
             },
         }
+        self.covers.render(frame);
+        if self.overlay == Overlay::None && self.manga.is_none() {
+            self.search.render_popup(frame, area);
+        }
         match &self.dialog {
             Some(Dialog::Download(dialog)) => dialog.render(frame, area),
             Some(Dialog::Delete(dialog)) => dialog.render(frame, area),
@@ -315,14 +332,26 @@ impl App {
         }
     }
 
-    /// Lets the reader update the images the terminal holds for the coming frame, and writes
-    /// that (and anything else queued) to the terminal ahead of the frame that uses it.
-    fn write_terminal_output(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    /// Lets the reader, or else the cover of the screen shown, update the images the terminal
+    /// holds for the coming frame.
+    fn prepare_frame(&mut self, area: Rect) {
         if let Some(reader) = &mut self.reader {
-            let size = terminal.size()?;
-            reader.prepare_frame(Rect::new(0, 0, size.width, size.height));
+            reader.prepare_frame(area);
             self.terminal_output.extend(reader.take_output());
         }
+        let wanted = match (&self.reader, self.overlay, &self.manga) {
+            (Some(_), _, _) | (None, Overlay::Downloads, _) => None,
+            (None, Overlay::Library, _) => self.library.cover(area),
+            (None, Overlay::None, Some(manga)) => manga.cover(area),
+            (None, Overlay::None, None) => self.search.cover(area),
+        };
+        self.covers.prepare(area, wanted);
+        self.terminal_output.extend(self.covers.take_output());
+    }
+
+    /// Writes the images' escape sequences (and anything else queued) to the terminal ahead
+    /// of the frame that uses them.
+    fn write_terminal_output(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.terminal_output.is_empty() {
             return Ok(());
         }
@@ -344,6 +373,19 @@ impl App {
                 let _ = tx.send(Message::Reader(Box::new(job.run())));
             });
         }
+    }
+
+    /// Loads the cover the screen waits for, off the UI thread.
+    fn start_cover_job(&mut self) {
+        let Some(source) = self.covers.take_job() else {
+            return;
+        };
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = cover::load(&client, source.clone()).await;
+            let _ = tx.send(Message::Cover { source, result });
+        });
     }
 
     fn is_busy(&self) -> bool {
@@ -409,8 +451,9 @@ impl App {
             return;
         }
         if overlay == Overlay::Library {
-            // Pick up chapters downloaded or added by hand since it was last open.
+            // Pick up chapters (and covers) downloaded or added by hand since it was last open.
             self.library.rescan(&self.reading);
+            self.covers.forget_local();
         }
         self.overlay = overlay;
     }
@@ -448,6 +491,7 @@ impl App {
                 result,
             } => self.on_deleted(&deletion, size, result),
             Message::Tags(result) => self.search.on_tags(result),
+            Message::Cover { source, result } => self.covers.on_loaded(source, result),
         }
     }
 

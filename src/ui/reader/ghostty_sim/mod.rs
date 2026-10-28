@@ -2081,3 +2081,73 @@ fn full_width_strips_meet_without_gaps() {
         h.press(KeyCode::Char('j'));
     }
 }
+
+/// A cover goes through the same placeholders as pages: one image and virtual placement,
+/// fitted into its cells by the terminal and centred, with nothing outside them.
+#[test]
+fn covers_fit_their_cells_centred() {
+    use crate::ui::cover::{CoverSource, Covers};
+
+    let shm = tempfile::tempdir().unwrap();
+    let medium = Medium::TempFile(shm.path().to_owned());
+    let picker = Picker::halfblocks();
+    let font = picker.font_size();
+    assert_eq!((font.width, font.height), (10, 20));
+    let mut covers = Covers::new(picker, Some(medium));
+    let mut ghostty = Ghostty::new((10, 20));
+    // Red says how far across the cover a pixel is, green how far down.
+    let cover = RgbImage::from_fn(300, 450, |x, y| {
+        Rgb([(x * 255 / 299) as u8, (y * 255 / 449) as u8, 0])
+    });
+    let source = CoverSource::Online {
+        manga_id: "m1".to_owned(),
+        file: "cover.jpg".to_owned(),
+    };
+    let screen = Rect::new(0, 0, 40, 20);
+    // 140 x 200 px of cells for a 2:3 cover: 133 px wide, 3.5 px spare on each side.
+    let rect = Rect::new(5, 2, 14, 10);
+    covers.prepare(screen, Some((source.clone(), rect)));
+    covers.on_loaded(source.clone(), Ok(cover));
+    covers.prepare(screen, Some((source, rect)));
+    ghostty.feed(&covers.take_output());
+    let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+    terminal.draw(|frame| covers.render(frame)).unwrap();
+
+    let shown = ghostty.render(terminal.backend().buffer());
+    assert!(ghostty.errors.is_empty(), "{:?}", ghostty.errors);
+    assert!(shown.errors.is_empty(), "{:?}", shown.errors);
+    assert_eq!(ghostty.placements.len(), 1);
+    let image = ghostty.images.values().next().unwrap();
+    assert_eq!((image.width, image.height), (133, 200));
+    // The 7 spare pixels are split between the sides, give or take the rounding.
+    let left = shown.at(rect.x, rect.y).unwrap().coverage;
+    let right = shown.at(rect.right() - 1, rect.y).unwrap().coverage;
+    assert!((left + right - 1.3).abs() < 0.01, "{left} + {right}");
+    assert!((left - right).abs() <= 0.1 + 1e-9, "{left} vs {right}");
+    let offset = 10.0 * (1.0 - left);
+    for y in 0..screen.height {
+        for x in 0..screen.width {
+            let cell = shown.at(x, y);
+            if !rect.contains((x, y).into()) {
+                assert!(cell.is_none(), "({x},{y}) is outside the cover");
+                continue;
+            }
+            let cell = cell.unwrap_or_else(|| panic!("({x},{y}) shows nothing"));
+            let (column, row) = (f64::from(x - rect.x), f64::from(y - rect.y));
+            let edge = column == 0.0 || column == f64::from(rect.width - 1);
+            if !edge {
+                assert!(
+                    (cell.coverage - 1.0).abs() < 0.01,
+                    "({x},{y}): {}",
+                    cell.coverage
+                );
+                let (cx, cy) = cell.centre();
+                assert!(
+                    (cx - (column * 10.0 + 5.0 - offset)).abs() < 0.5,
+                    "({x},{y}): x {cx}"
+                );
+                assert!((cy - (row * 20.0 + 10.0)).abs() < 0.5, "({x},{y}): y {cy}");
+            }
+        }
+    }
+}

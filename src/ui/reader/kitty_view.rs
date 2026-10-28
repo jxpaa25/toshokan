@@ -3,7 +3,6 @@
 //! redraws placeholder cells.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::PathBuf;
 
 use ratatui::Frame;
@@ -15,7 +14,7 @@ use super::ViewState;
 use super::layout::{Placement, place};
 use crate::library::LocalChapter;
 use crate::library::prepare::{Bounds, fitted_size, prepare};
-use crate::ui::kitty::{self, Medium, Placeholders};
+use crate::ui::kitty::{self, Medium, Payload, Placeholders};
 
 /// Pages prepared at once. Each takes 10–20 ms; more would only compete with the current page.
 const MAX_IN_FLIGHT: usize = 3;
@@ -41,61 +40,6 @@ struct PreparedPage {
     native: (u32, u32),
     size: (u32, u32),
     payload: Payload,
-}
-
-/// An image's pixels on their way to the terminal.
-pub(super) enum Payload {
-    File(TempFile),
-    Rgb(Vec<u8>),
-}
-
-impl Payload {
-    /// Writes the pixels to `file` for the terminal to read; without a file, or when writing
-    /// fails (e.g. /dev/shm is full), they're sent inline.
-    pub(super) fn new(file: Option<PathBuf>, rgb: Vec<u8>) -> Self {
-        let Some(path) = file else {
-            return Payload::Rgb(rgb);
-        };
-        let file = TempFile(Some(path));
-        match fs::write(file.path(), &rgb) {
-            Ok(()) => Payload::File(file),
-            Err(_) => Payload::Rgb(rgb),
-        }
-    }
-
-    /// Sends the image as `id` and creates its `placed` placement.
-    pub(super) fn transmit(self, out: &mut Vec<u8>, id: u32, size: (u32, u32), placed: (u16, u16)) {
-        match self {
-            Payload::File(file) => {
-                kitty::transmit_file(out, id, size, file.path(), placed);
-                file.hand_over();
-            }
-            Payload::Rgb(rgb) => kitty::transmit_direct(out, id, size, &rgb, placed),
-        }
-    }
-}
-
-/// A page file waiting for the terminal. It's removed when dropped (the reader moved on, the
-/// app quit, the result never arrived) unless it was handed to the terminal, which deletes it
-/// after reading.
-pub(super) struct TempFile(Option<PathBuf>);
-
-impl TempFile {
-    fn path(&self) -> &std::path::Path {
-        self.0.as_deref().expect("only empty after hand_over")
-    }
-
-    fn hand_over(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
 }
 
 impl PrepareJob {
@@ -318,7 +262,7 @@ impl KittyView {
     }
 
     fn refresh_cell_size(&mut self) {
-        if let Some(cell) = terminal_cell() {
+        if let Some(cell) = kitty::cell_size() {
             self.cell = cell;
         }
     }
@@ -381,14 +325,6 @@ impl KittyView {
     }
 }
 
-/// The terminal's cell size in pixels, which follows font size changes; it reports its size in
-/// pixels and cells.
-pub(super) fn terminal_cell() -> Option<(u16, u16)> {
-    let size = crossterm::terminal::window_size().ok()?;
-    (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0)
-        .then(|| (size.width / size.columns, size.height / size.rows))
-}
-
 /// The views kept in the terminal, most urgent first: current, next, previous, the one after.
 fn window(state: &ViewState) -> Vec<usize> {
     let view = state.view;
@@ -416,6 +352,7 @@ mod tests {
     use crate::library::state::Direction;
     use crate::ui::reader::{Fit, PageLayout, layout::page_views};
     use image::DynamicImage;
+    use std::fs;
     use std::path::Path;
 
     struct Fixture {

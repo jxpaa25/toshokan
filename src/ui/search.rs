@@ -3,11 +3,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
+use super::cover::{CoverSource, cover_rect};
 use super::filters::{self, Closed, FilterPopup, TagList};
 use super::input::TextInput;
 use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
@@ -19,6 +20,8 @@ use crate::config::Settings;
 const RESULT_WINDOW: u32 = 10_000;
 /// Below this width the details pane goes under the results instead of beside them.
 const SIDE_BY_SIDE_WIDTH: u16 = 100;
+/// The tallest cover in the details pane, in rows.
+const COVER_ROWS: u16 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchRequest {
@@ -259,13 +262,20 @@ impl SearchScreen {
         self.results.get(self.list.selected()?)
     }
 
+    /// The selected result's cover, and where the details pane shows it.
+    pub fn cover(&self, area: Rect) -> Option<(CoverSource, Rect)> {
+        let manga = self.selected()?;
+        let (cover, _) = details_layout(areas(area).details, manga);
+        Some((CoverSource::online(manga)?, cover?))
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect, settings: &Settings, spinner: &str) {
-        let [input_area, body, footer] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let Areas {
+            input: input_area,
+            results: results_area,
+            details: details_area,
+            footer,
+        } = areas(area);
 
         let mut input_block = panel(" Search MangaDex ", self.focus == Focus::Input);
         if let Some(summary) = filters::summary(&self.filters) {
@@ -281,14 +291,13 @@ impl SearchScreen {
             self.focus == Focus::Input,
         );
 
-        let [results_area, details_area] = if body.width >= SIDE_BY_SIDE_WIDTH {
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body)
-        } else {
-            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body)
-        };
         self.render_results(frame, results_area, settings, spinner);
         self.render_details(frame, details_area);
         self.render_footer(frame, footer, settings);
+    }
+
+    /// The filters popup, drawn after everything else, the cover included.
+    pub fn render_popup(&self, frame: &mut Frame, area: Rect) {
         if let Some(popup) = &self.popup {
             popup.render(frame, area, &self.tags);
         }
@@ -349,11 +358,12 @@ impl SearchScreen {
     }
 
     fn render_details(&self, frame: &mut Frame, area: Rect) {
-        let block = panel(" Details ", false);
+        frame.render_widget(panel(" Details ", false), area);
         let Some(manga) = self.selected() else {
-            frame.render_widget(block, area);
             return;
         };
+        // The cover itself is drawn by the app, into the space left for it.
+        let (_, text_area) = details_layout(area, manga);
 
         let mut text = Text::from(Line::from(manga.title.clone().bold()));
         if !manga.authors.is_empty() {
@@ -377,8 +387,8 @@ impl SearchScreen {
             None => text.push_line("No description.".dark_gray()),
         }
 
-        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).block(block);
-        frame.render_widget(paragraph, area);
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, text_area);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect, settings: &Settings) {
@@ -422,6 +432,54 @@ impl SearchScreen {
         frame.render_widget(Paragraph::new(status), left);
         frame.render_widget(Paragraph::new(adult), right);
     }
+}
+
+/// Where the parts of the screen go.
+struct Areas {
+    input: Rect,
+    results: Rect,
+    details: Rect,
+    footer: Rect,
+}
+
+fn areas(area: Rect) -> Areas {
+    let [input, body, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    let [results, details] = if body.width >= SIDE_BY_SIDE_WIDTH {
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body)
+    } else {
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body)
+    };
+    Areas {
+        input,
+        results,
+        details,
+        footer,
+    }
+}
+
+/// The details pane's cover, at its top left when the manga has one and there's room, and
+/// the space for the text beside it.
+fn details_layout(details: Rect, manga: &Manga) -> (Option<Rect>, Rect) {
+    let inner = details.inner(Margin::new(1, 1));
+    if manga.cover_file.is_none() || inner.width < 40 || inner.height < 6 {
+        return (None, inner);
+    }
+    let room = Rect {
+        width: inner.width / 3,
+        ..inner
+    };
+    let cover = cover_rect(room, COVER_ROWS, false);
+    let text = Rect {
+        x: cover.right() + 2,
+        width: inner.width - cover.width - 2,
+        ..inner
+    };
+    (Some(cover), text)
 }
 
 /// `text` cut to `width` columns with an ellipsis.
@@ -585,7 +643,10 @@ mod tests {
     fn draw(screen: &mut SearchScreen) -> String {
         let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
         terminal
-            .draw(|frame| screen.render(frame, frame.area(), &Settings::default(), "⠋"))
+            .draw(|frame| {
+                screen.render(frame, frame.area(), &Settings::default(), "⠋");
+                screen.render_popup(frame, frame.area());
+            })
             .unwrap();
         buffer_text(&terminal)
     }
@@ -644,6 +705,36 @@ mod tests {
         screen.handle_key(key(KeyCode::Esc));
         assert_eq!(screen.filters.statuses, [Status::Completed]);
         assert!(draw(&mut screen).contains("Most followed · completed · +Action"));
+    }
+
+    #[test]
+    fn shows_the_selected_result_with_its_cover() {
+        let mut screen = SearchScreen::default();
+        type_query(&mut screen, "berserk");
+        let (generation, _) = search_generation(screen.handle_key(key(KeyCode::Enter)));
+        let with_cover = Manga {
+            cover_file: Some("c.jpg".to_owned()),
+            ..manga("2", "Berserk Gaiden")
+        };
+        screen.on_results(generation, page(vec![manga("1", "Berserk"), with_cover], 2));
+        let area = Rect::new(0, 0, 110, 30);
+        assert_eq!(screen.cover(area), None, "no cover on MangaDex");
+
+        screen.handle_key(key(KeyCode::Down));
+        let (source, rect) = screen.cover(area).unwrap();
+        assert!(matches!(source, CoverSource::Online { manga_id, .. } if manga_id == "2"));
+        // The details pane's border is at column 50; its cover takes a third of the 58
+        // columns inside, and the text starts two columns after it.
+        assert_eq!(rect, Rect::new(51, 4, 19, 14));
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, area, &Settings::default(), "⠋"))
+            .unwrap();
+        let line = buffer_text(&terminal).lines().nth(4).unwrap().to_owned();
+        assert!(
+            line.contains("││                     Berserk Gaiden"),
+            "{line}"
+        );
     }
 
     #[test]

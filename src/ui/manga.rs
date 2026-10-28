@@ -5,17 +5,36 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
+use super::cover::{CoverSource, cover_rect};
 use super::{groups_label, join_spans, key_hints, panel, rating_span, strip_link_section};
 use crate::api::{Chapter, ChapterSlot, Manga};
 use crate::app::Action;
 
 const HEADER_HEIGHT: u16 = 7;
+/// Taller, to fit the cover beside the description.
+const COVER_HEADER_HEIGHT: u16 = 11;
 const LANGUAGES_WIDTH: u16 = 34;
+
+/// The header's cover, at its left when the manga has one and there's room, and the space
+/// for the text beside it.
+fn header_layout(header: Rect, manga: &Manga) -> (Option<Rect>, Rect) {
+    let inner = header.inner(Margin::new(1, 1));
+    if manga.cover_file.is_none() || inner.width < 40 {
+        return (None, inner);
+    }
+    let cover = cover_rect(inner, inner.height, false);
+    let text = Rect {
+        x: cover.right() + 2,
+        width: inner.width.saturating_sub(cover.width + 2),
+        ..inner
+    };
+    (Some(cover), text)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -330,13 +349,30 @@ impl MangaScreen {
         None
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, spinner: &str) {
-        let [header, body, footer] = Layout::vertical([
-            Constraint::Length(HEADER_HEIGHT),
+    /// The manga's cover and where the header shows it.
+    pub fn cover(&self, area: Rect) -> Option<(CoverSource, Rect)> {
+        let [header, _, _] = self.areas(area);
+        let (cover, _) = header_layout(header, &self.manga);
+        Some((CoverSource::online(&self.manga)?, cover?))
+    }
+
+    /// The header, the languages and chapters below it, and the footer.
+    fn areas(&self, area: Rect) -> [Rect; 3] {
+        let header = if self.manga.cover_file.is_some() {
+            COVER_HEADER_HEIGHT
+        } else {
+            HEADER_HEIGHT
+        };
+        Layout::vertical([
+            Constraint::Length(header),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .areas(area);
+        .areas(area)
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, spinner: &str) {
+        let [header, body, footer] = self.areas(area);
         let [languages_area, chapters_area] =
             Layout::horizontal([Constraint::Length(LANGUAGES_WIDTH), Constraint::Min(0)])
                 .areas(body);
@@ -367,10 +403,11 @@ impl MangaScreen {
             Some(description) => text.extend(Text::from(description).dark_gray()),
             None => text.push_line("No description.".dark_gray()),
         }
-        let paragraph = Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(panel(" Manga ", false));
-        frame.render_widget(paragraph, area);
+        frame.render_widget(panel(" Manga ", false), area);
+        // The cover itself is drawn by the app, into the space left for it.
+        let (_, text_area) = header_layout(area, manga);
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, text_area);
     }
 
     fn render_languages(&mut self, frame: &mut Frame, area: Rect) {
@@ -637,6 +674,41 @@ mod tests {
             authors: vec!["Miura Kentarou".to_owned()],
             cover_file: None,
         }
+    }
+
+    #[test]
+    fn leaves_room_for_the_cover_beside_the_description() {
+        let area = Rect::new(0, 0, 100, 30);
+        let (screen, _) = MangaScreen::new(manga(&["en"]), "en");
+        assert_eq!(screen.cover(area), None, "no cover on MangaDex");
+
+        let with_cover = Manga {
+            cover_file: Some("c.jpg".to_owned()),
+            ..manga(&["en"])
+        };
+        let (mut screen, _) = MangaScreen::new(with_cover, "en");
+        let (source, rect) = screen.cover(area).unwrap();
+        assert_eq!(
+            source,
+            CoverSource::Online {
+                manga_id: "m1".to_owned(),
+                file: "c.jpg".to_owned()
+            }
+        );
+        // The header grows to 11 rows; the cover fills its 9 inner rows.
+        assert_eq!(rect, Rect::new(1, 1, 13, 9));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), "⠋"))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[1].starts_with("│               Berserk"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[11].starts_with("┌ Language"), "{}", lines[11]);
     }
 
     fn upload(id: &str, group: &str) -> Chapter {

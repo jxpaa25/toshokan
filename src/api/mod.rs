@@ -198,6 +198,22 @@ impl Client {
         Ok(response.bytes().await?)
     }
 
+    /// MangaDex's `size` pixels wide JPEG of a cover (256 or 512), for showing it small.
+    pub async fn fetch_cover_thumbnail(
+        &self,
+        manga_id: &str,
+        file_name: &str,
+        size: u16,
+    ) -> Result<Bytes> {
+        let response = self
+            .http
+            .get(cover_url(manga_id, file_name, Some(size)))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response.bytes().await?)
+    }
+
     async fn download_image(&self, url: &str) -> Result<(Bytes, bool)> {
         let response = self.http.get(url).send().await?;
         let status = response.status();

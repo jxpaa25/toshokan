@@ -11,11 +11,10 @@ use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 
 use super::ViewState;
-use super::kitty_view::{Payload, terminal_cell};
 use super::layout::{StripLayout, StripSlice, tiles};
 use crate::library::prepare::fill_cells;
 use crate::library::{LocalChapter, pages};
-use crate::ui::kitty::{self, Medium, Placeholders};
+use crate::ui::kitty::{self, Medium, Payload, Placeholders};
 
 /// Pages prepared at once, as for single pages.
 const MAX_IN_FLIGHT: usize = 3;
@@ -122,7 +121,7 @@ impl StripView {
     pub fn cell(&mut self, area: Rect) -> (u16, u16) {
         if area != self.area {
             self.area = area;
-            if let Some(cell) = terminal_cell() {
+            if let Some(cell) = kitty::cell_size() {
                 self.cell = cell;
             }
         }

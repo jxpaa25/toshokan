@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use toshokan::api::{Client, Demographic, Quality, SearchFilters, Sort, Status};
 use toshokan::library::link::MangaLink;
 use toshokan::library::updates::{CheckEvent, Outcome, check_library};
+use toshokan::ui::cover::{self, CoverSource};
 
 /// Berserk, which MangaDex rates "erotica".
 const BERSERK: &str = "801513ba-a712-498c-8f57-cae55b38cc92";
@@ -68,6 +69,34 @@ async fn browses_by_filters_and_tags() {
     };
     let page = client.search_manga("", &year, 0, false).await.unwrap();
     assert!(page.items.iter().all(|m| m.year == Some(1989)));
+}
+
+#[tokio::test]
+#[ignore = "requires network access to MangaDex"]
+async fn loads_covers_online_and_for_linked_folders() {
+    let client = Client::new().unwrap();
+    let berserk = client.manga(BERSERK).await.unwrap();
+    let online = CoverSource::online(&berserk).expect("Berserk has a cover");
+    let thumbnail = cover::load(&client, online).await.unwrap();
+    assert_eq!(thumbnail.width(), 512);
+
+    // A linked folder without a cover gets MangaDex's, saved next to its chapters.
+    let library = tempfile::tempdir().unwrap();
+    let dir = library.path().join("Berserk");
+    fs::create_dir(&dir).unwrap();
+    let source = CoverSource::Local {
+        dir: Some(dir.clone()),
+        manga_id: Some(BERSERK.to_owned()),
+        first_chapter: None,
+    };
+    let image = cover::load(&client, source).await.unwrap();
+    assert!(image.width() <= 512 && image.height() <= 768);
+    let saved: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(saved.len(), 1);
+    assert!(saved[0].starts_with("cover."), "{saved:?}");
 }
 
 #[tokio::test]
