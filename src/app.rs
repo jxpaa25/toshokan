@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage};
+use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage, Tag};
 use crate::config::Config;
 use crate::download::{self, Downloader, Job, OutputFormat, SavedQueue};
 use crate::library::delete::{self, Deletion};
@@ -41,6 +41,8 @@ const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 #[derive(Debug)]
 pub enum Action {
     Search(SearchRequest),
+    /// Fetch the tags the search filters offer.
+    LoadTags,
     ToggleAdult,
     OpenManga(Manga),
     LoadChapters {
@@ -150,6 +152,7 @@ pub enum Message {
         size: u64,
         result: Result<(), String>,
     },
+    Tags(Result<Vec<Tag>, String>),
 }
 
 /// A popup over the current screen, which gets the keys while it's open.
@@ -444,6 +447,7 @@ impl App {
                 size,
                 result,
             } => self.on_deleted(&deletion, size, result),
+            Message::Tags(result) => self.search.on_tags(result),
         }
     }
 
@@ -604,6 +608,14 @@ impl App {
     fn perform(&mut self, action: Action) {
         match action {
             Action::Search(request) => self.spawn_search(request),
+            Action::LoadTags => {
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = client.tags().await.map_err(|err| err.to_string());
+                    let _ = tx.send(Message::Tags(result));
+                });
+            }
             Action::ToggleAdult => {
                 let settings = &mut self.config.settings;
                 settings.include_adult = !settings.include_adult;
@@ -931,7 +943,12 @@ impl App {
         let include_adult = self.config.settings.include_adult;
         tokio::spawn(async move {
             let result = client
-                .search_manga(&request.query, request.offset, include_adult)
+                .search_manga(
+                    &request.query,
+                    &request.filters,
+                    request.offset,
+                    include_adult,
+                )
                 .await
                 .map_err(|err| err.to_string());
             let _ = tx.send(Message::SearchResults {

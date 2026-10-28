@@ -1,4 +1,5 @@
-//! Search screen: a query box, paginated results, and details for the selected manga.
+//! Search screen: a query box with filters, paginated results, and details for the selected
+//! manga.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -7,9 +8,10 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
+use super::filters::{self, Closed, FilterPopup, TagList};
 use super::input::TextInput;
 use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
-use crate::api::{ContentRating, Manga, SEARCH_PAGE_SIZE, SearchPage};
+use crate::api::{ContentRating, Manga, SEARCH_PAGE_SIZE, SearchFilters, SearchPage, Tag};
 use crate::app::Action;
 use crate::config::Settings;
 
@@ -22,7 +24,9 @@ const SIDE_BY_SIDE_WIDTH: u16 = 100;
 pub struct SearchRequest {
     /// Lets the screen ignore responses to searches it has since replaced.
     pub generation: u64,
+    /// Empty to browse by the filters alone.
     pub query: String,
+    pub filters: SearchFilters,
     pub offset: u32,
 }
 
@@ -50,6 +54,11 @@ pub struct SearchScreen {
     error: Option<String>,
     notice: Option<String>,
     generation: u64,
+    /// The filters searches use, kept for the session.
+    filters: SearchFilters,
+    /// Open over the screen while filters are being changed.
+    popup: Option<FilterPopup>,
+    tags: TagList,
 }
 
 impl Default for SearchScreen {
@@ -65,6 +74,9 @@ impl Default for SearchScreen {
             error: None,
             notice: None,
             generation: 0,
+            filters: SearchFilters::default(),
+            popup: None,
+            tags: TagList::NotLoaded,
         }
     }
 }
@@ -80,8 +92,26 @@ impl SearchScreen {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        if let Some(popup) = &mut self.popup {
+            return match popup.handle_key(key, &self.tags)? {
+                Closed::Search(filters) => {
+                    self.popup = None;
+                    self.filters = filters;
+                    self.submit()
+                }
+                Closed::Cancel => {
+                    self.popup = None;
+                    None
+                }
+            };
+        }
         if key.code == KeyCode::F(2) {
             return Some(Action::ToggleAdult);
+        }
+        if key.code == KeyCode::F(4)
+            || (self.focus == Focus::Results && key.code == KeyCode::Char('f'))
+        {
+            return self.open_filters();
         }
         match self.focus {
             Focus::Input => self.handle_input_key(key),
@@ -129,13 +159,29 @@ impl SearchScreen {
         }
     }
 
-    /// Starts a new search for the input's text, replacing any shown results.
-    fn submit(&mut self) -> Option<Action> {
-        let query = self.input.value().trim();
-        if query.is_empty() {
-            return None;
+    /// Opens the filters, fetching the tags to pick from the first time.
+    fn open_filters(&mut self) -> Option<Action> {
+        self.popup = Some(FilterPopup::new(&self.filters));
+        match self.tags {
+            TagList::NotLoaded | TagList::Failed(_) => {
+                self.tags = TagList::Loading;
+                Some(Action::LoadTags)
+            }
+            TagList::Loading | TagList::Loaded(_) => None,
         }
-        let query = query.to_owned();
+    }
+
+    pub fn on_tags(&mut self, result: Result<Vec<Tag>, String>) {
+        self.tags = match result {
+            Ok(tags) => TagList::Loaded(tags),
+            Err(err) => TagList::Failed(err),
+        };
+    }
+
+    /// Starts a new search for the input's text, replacing any shown results. Without any
+    /// text it browses by the filters alone.
+    fn submit(&mut self) -> Option<Action> {
+        let query = self.input.value().trim().to_owned();
         self.results.clear();
         self.total = 0;
         self.list.select(None);
@@ -160,6 +206,7 @@ impl SearchScreen {
         Action::Search(SearchRequest {
             generation: self.generation,
             query,
+            filters: self.filters.clone(),
             offset,
         })
     }
@@ -220,12 +267,17 @@ impl SearchScreen {
         ])
         .areas(area);
 
-        let input_block = panel(" Search MangaDex ", self.focus == Focus::Input);
+        let mut input_block = panel(" Search MangaDex ", self.focus == Focus::Input);
+        if let Some(summary) = filters::summary(&self.filters) {
+            let room = (input_area.width as usize).saturating_sub(4);
+            input_block = input_block
+                .title_bottom(Line::from(format!(" {} ", truncate(&summary, room))).cyan());
+        }
         self.input.render(
             frame,
             input_area,
             input_block,
-            "Type a title and press Enter",
+            "Type a title and press Enter, or just Enter to browse",
             self.focus == Focus::Input,
         );
 
@@ -237,6 +289,9 @@ impl SearchScreen {
         self.render_results(frame, results_area, settings, spinner);
         self.render_details(frame, details_area);
         self.render_footer(frame, footer, settings);
+        if let Some(popup) = &self.popup {
+            popup.render(frame, area, &self.tags);
+        }
     }
 
     fn render_results(
@@ -262,7 +317,14 @@ impl SearchScreen {
                 (_, Some(err), _) => Text::from(format!("Search failed: {err}").red()),
                 (_, _, None) => Text::from("Results show up here.".dark_gray()),
                 (_, _, Some(query)) => {
-                    let mut text = Text::from(format!("No manga found for “{query}”."));
+                    let mut text = match (query.as_str(), self.filters == SearchFilters::default())
+                    {
+                        ("", _) => Text::from("No manga match these filters (F4 changes them)."),
+                        (query, true) => Text::from(format!("No manga found for “{query}”.")),
+                        (query, false) => Text::from(format!(
+                            "No manga found for “{query}” with these filters (F4 changes them)."
+                        )),
+                    };
                     if !settings.include_adult {
                         text.push_line("Adult titles are hidden (F2 to show them).".dark_gray());
                     }
@@ -337,6 +399,7 @@ impl SearchScreen {
             let keys: &[(&str, &str)] = match self.focus {
                 Focus::Input => &[
                     ("Enter", "search"),
+                    ("F4", "filters"),
                     ("Tab", "results"),
                     ("F2", "adult"),
                     ("F1", "library"),
@@ -347,6 +410,7 @@ impl SearchScreen {
                     ("↑↓", "move"),
                     ("Enter", "open"),
                     ("/", "search"),
+                    ("f", "filters"),
                     ("F2", "adult"),
                     ("F1", "library"),
                     ("F3", "downloads"),
@@ -358,6 +422,15 @@ impl SearchScreen {
         frame.render_widget(Paragraph::new(status), left);
         frame.render_widget(Paragraph::new(adult), right);
     }
+}
+
+/// `text` cut to `width` columns with an ellipsis.
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{cut}…")
 }
 
 fn result_item(manga: &Manga) -> ListItem<'_> {
@@ -383,6 +456,7 @@ fn result_item(manga: &Manga) -> ListItem<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{Sort, Status};
     use crate::ui::buffer_text;
     use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
@@ -428,10 +502,13 @@ mod tests {
     }
 
     #[test]
-    fn enter_searches_trimmed_query_and_ignores_blank() {
+    fn enter_searches_the_trimmed_query_or_browses() {
         let mut screen = SearchScreen::default();
         type_query(&mut screen, "   ");
-        assert!(screen.handle_key(key(KeyCode::Enter)).is_none());
+        match screen.handle_key(key(KeyCode::Enter)) {
+            Some(Action::Search(request)) => assert_eq!(request.query, ""),
+            _ => panic!("expected to browse"),
+        }
 
         type_query(&mut screen, "berserk ");
         match screen.handle_key(key(KeyCode::Enter)) {
@@ -503,6 +580,70 @@ mod tests {
         assert!(screen_text.contains("A story."));
         assert!(!screen_text.contains("Links"));
         assert!(screen_text.contains("Adult: off"));
+    }
+
+    fn draw(screen: &mut SearchScreen) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), &Settings::default(), "⠋"))
+            .unwrap();
+        buffer_text(&terminal)
+    }
+
+    #[test]
+    fn filters_narrow_searches_until_changed() {
+        let mut screen = SearchScreen::default();
+        type_query(&mut screen, "berserk");
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::F(4))),
+            Some(Action::LoadTags)
+        ));
+        assert!(draw(&mut screen).contains("Loading tags…"));
+        screen.on_tags(Ok(vec![Tag {
+            id: "t1".to_owned(),
+            name: "Action".to_owned(),
+        }]));
+        // Sort, status (completed) and then the Action tag.
+        screen.handle_key(key(KeyCode::Right));
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Right));
+        screen.handle_key(key(KeyCode::Char(' ')));
+        screen.handle_key(key(KeyCode::Up));
+        screen.handle_key(key(KeyCode::Up));
+        screen.handle_key(key(KeyCode::Char(' ')));
+        assert!(draw(&mut screen).contains("+Action"));
+
+        let request = match screen.handle_key(key(KeyCode::Enter)) {
+            Some(Action::Search(request)) => request,
+            _ => panic!("expected a search"),
+        };
+        assert_eq!(request.query, "berserk");
+        assert_eq!(request.filters.sort, Sort::MostFollowed);
+        assert_eq!(request.filters.statuses, [Status::Completed]);
+        assert_eq!(request.filters.included_tags.len(), 1);
+        screen.on_results(request.generation, page(vec![], 0));
+        let text = draw(&mut screen);
+        assert!(
+            text.contains("Most followed · completed · +Action"),
+            "{text}"
+        );
+        assert!(
+            text.contains("No manga found for “berserk” with these filters (F4 changes them).")
+        );
+
+        // The next search keeps them; the tags aren't fetched again.
+        screen.handle_key(key(KeyCode::Tab));
+        let request = match screen.handle_key(key(KeyCode::Enter)) {
+            Some(Action::Search(request)) => request,
+            _ => panic!("expected a search"),
+        };
+        assert_eq!(request.filters.statuses, [Status::Completed]);
+        assert!(screen.handle_key(key(KeyCode::F(4))).is_none());
+        // Esc drops changes made in the popup.
+        screen.handle_key(key(KeyCode::Delete));
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.filters.statuses, [Status::Completed]);
+        assert!(draw(&mut screen).contains("Most followed · completed · +Action"));
     }
 
     #[test]

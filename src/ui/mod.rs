@@ -3,6 +3,7 @@
 pub mod delete_dialog;
 pub mod download_dialog;
 pub mod downloads;
+pub mod filters;
 pub mod input;
 pub mod kitty;
 pub mod library;

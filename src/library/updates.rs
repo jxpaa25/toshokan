@@ -12,7 +12,7 @@ use zip::ZipArchive;
 
 use super::link::MangaLink;
 use super::{ChapterKind, LibraryManga, LocalChapter, chapter_number};
-use crate::api::{self, Chapter, ChapterSlot, Client};
+use crate::api::{self, Chapter, ChapterSlot, Client, SearchFilters};
 use crate::download;
 
 /// How many CBZ files to look in for a ComicInfo.xml chapter link before trying the title.
@@ -171,7 +171,9 @@ async fn find_link(
             Err(err) => return Err(err),
         }
     }
-    let results = client.search_manga(&manga.title, 0, include_adult).await?;
+    let results = client
+        .search_manga(&manga.title, &SearchFilters::default(), 0, include_adult)
+        .await?;
     let mut matches = results
         .items
         .into_iter()

@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::sync::Mutex;
 
-use toshokan::api::{Client, Quality};
+use toshokan::api::{Client, Demographic, Quality, SearchFilters, Sort, Status};
 use toshokan::library::link::MangaLink;
 use toshokan::library::updates::{CheckEvent, Outcome, check_library};
 
@@ -16,11 +16,18 @@ const BERSERK: &str = "801513ba-a712-498c-8f57-cae55b38cc92";
 async fn search_respects_adult_setting() {
     let client = Client::new().unwrap();
 
-    let safe = client.search_manga("berserk", 0, false).await.unwrap();
+    let none = SearchFilters::default();
+    let safe = client
+        .search_manga("berserk", &none, 0, false)
+        .await
+        .unwrap();
     assert!(safe.items.iter().all(|m| !m.content_rating.is_adult()));
     assert!(safe.items.iter().all(|m| m.id != BERSERK));
 
-    let all = client.search_manga("berserk", 0, true).await.unwrap();
+    let all = client
+        .search_manga("berserk", &none, 0, true)
+        .await
+        .unwrap();
     let berserk = all
         .items
         .iter()
@@ -29,6 +36,38 @@ async fn search_respects_adult_setting() {
     assert_eq!(berserk.title, "Berserk");
     assert!(berserk.cover_file.is_some());
     assert!(!berserk.authors.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires network access to MangaDex"]
+async fn browses_by_filters_and_tags() {
+    let client = Client::new().unwrap();
+    let tags = client.tags().await.unwrap();
+    assert!(tags.len() > 50, "{} tags", tags.len());
+    let tag = |name: &str| tags.iter().find(|t| t.name == name).unwrap().clone();
+
+    let mut filters = SearchFilters {
+        sort: Sort::MostFollowed,
+        included_tags: vec![tag("Action")],
+        excluded_tags: vec![tag("Romance")],
+        ..SearchFilters::default()
+    };
+    filters.toggle_status(Status::Completed);
+    filters.toggle_demographic(Demographic::Seinen);
+    let page = client.search_manga("", &filters, 0, false).await.unwrap();
+    assert!(page.total > 10, "{} results", page.total);
+    assert!(
+        page.items
+            .iter()
+            .all(|m| m.status.as_deref() == Some("completed"))
+    );
+
+    let year = SearchFilters {
+        year: Some(1989),
+        ..SearchFilters::default()
+    };
+    let page = client.search_manga("", &year, 0, false).await.unwrap();
+    assert!(page.items.iter().all(|m| m.year == Some(1989)));
 }
 
 #[tokio::test]

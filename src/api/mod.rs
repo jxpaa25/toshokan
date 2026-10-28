@@ -1,10 +1,12 @@
 //! Rate-limited client for the MangaDex REST API and its MangaDex@Home image servers.
 
 mod models;
+mod search;
 
 pub use models::{
     Chapter, ChapterSlot, ContentRating, Manga, PageSource, Quality, SearchPage, group_chapters,
 };
+pub use search::{Demographic, SearchFilters, Sort, Status, Tag, TagFilter};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -73,30 +75,34 @@ impl Client {
         })
     }
 
+    /// A page of manga matching `title` and `filters`; an empty title browses everything.
     pub async fn search_manga(
         &self,
         title: &str,
+        filters: &SearchFilters,
         offset: u32,
         include_adult: bool,
     ) -> Result<SearchPage> {
-        let mut query: Query = vec![
-            ("title", title.to_owned()),
-            ("limit", SEARCH_PAGE_SIZE.to_string()),
-            ("offset", offset.to_string()),
-            ("order[relevance]", "desc".to_owned()),
-            ("includes[]", "cover_art".to_owned()),
-            ("includes[]", "author".to_owned()),
-            ("includes[]", "artist".to_owned()),
-        ];
-        for rating in ContentRating::allowed(include_adult) {
-            query.push(("contentRating[]", rating.as_str().to_owned()));
-        }
+        let query = search::search_query(title, filters, offset, include_adult);
         let page: Collection<Entity<MangaAttributes>> = self.get("/manga", &query).await?;
         Ok(SearchPage {
             items: page.data.into_iter().map(Manga::from).collect(),
             offset: page.offset,
             total: page.total,
         })
+    }
+
+    /// Every tag MangaDex has, by name.
+    pub async fn tags(&self) -> Result<Vec<Tag>> {
+        let page: Collection<Entity<search::TagAttributes>> =
+            self.get("/manga/tag", &Query::new()).await?;
+        let mut tags: Vec<Tag> = page
+            .data
+            .into_iter()
+            .filter_map(|entity| Tag::new(entity.id, entity.attributes))
+            .collect();
+        tags.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(tags)
     }
 
     pub async fn manga(&self, id: &str) -> Result<Manga> {

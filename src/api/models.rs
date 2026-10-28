@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub type LocalizedString = HashMap<String, String>;
 
 /// Some localized fields come back as `[]` instead of `{}` when empty.
-fn localized<'de, D: Deserializer<'de>>(de: D) -> Result<LocalizedString, D::Error> {
+pub(super) fn localized<'de, D: Deserializer<'de>>(de: D) -> Result<LocalizedString, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum MapOrList {
