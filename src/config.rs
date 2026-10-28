@@ -16,8 +16,8 @@ use toml_edit::{DocumentMut, Value};
 use crate::api::Quality;
 use crate::download::OutputFormat;
 
-const TEMPLATE: &str = r#"# toshokan settings. The app updates include_adult, quality and format as you change
-# them; edit the rest here and restart.
+const TEMPLATE: &str = r#"# toshokan settings. Changes made in the app's Settings (F5) are saved here, keeping
+# your comments; edits made here while it runs take effect on restart.
 
 # Show erotica and pornographic titles in search (F2 toggles this in the app).
 include_adult = false
@@ -36,6 +36,18 @@ language = "en"
 # The TOSHOKAN_DIR environment variable overrides this.
 download_dir = "~/Manga"
 "#;
+
+/// The template's first two lines, which explain how the file is kept.
+const TEMPLATE_HEADER: &str =
+    "# toshokan settings. Changes made in the app's Settings (F5) are saved here, keeping
+# your comments; edits made here while it runs take effect on restart.
+";
+
+/// The first lines of files written by versions that only saved some settings.
+const OLD_HEADER: &str =
+    "# toshokan settings. The app updates include_adult, quality and format as you change
+# them; edit the rest here and restart.
+";
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -67,6 +79,11 @@ impl Settings {
             Some(dir) => PathBuf::from(dir),
             None => expand_home(&self.download_dir),
         }
+    }
+
+    /// Whether `$TOSHOKAN_DIR` decides the download folder instead of `download_dir`.
+    pub fn download_dir_overridden() -> bool {
+        std::env::var_os("TOSHOKAN_DIR").is_some()
     }
 }
 
@@ -125,10 +142,13 @@ impl Config {
         &self.path
     }
 
-    /// Writes the settings the app changes at runtime back to the file.
+    /// Writes the settings back to the file, keeping comments and anything else in it.
     pub fn save(&self) -> io::Result<()> {
         let text = match fs::read_to_string(&self.path) {
-            Ok(text) => text,
+            Ok(text) => match text.strip_prefix(OLD_HEADER) {
+                Some(rest) => format!("{}{rest}", TEMPLATE_HEADER),
+                None => text,
+            },
             Err(err) if err.kind() == io::ErrorKind::NotFound => TEMPLATE.to_owned(),
             Err(err) => return Err(err),
         };
@@ -142,6 +162,12 @@ impl Config {
         );
         set(&mut doc, "quality", self.settings.quality.as_str().into());
         set(&mut doc, "format", self.settings.format.as_str().into());
+        set(&mut doc, "language", self.settings.language.as_str().into());
+        set(
+            &mut doc,
+            "download_dir",
+            self.settings.download_dir.as_str().into(),
+        );
         write_atomically(&self.path, &doc.to_string())
     }
 }
@@ -200,7 +226,8 @@ pub(crate) fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     fs::rename(&partial, path)
 }
 
-fn expand_home(path: &str) -> PathBuf {
+/// `path` with a leading `~` replaced by the home folder.
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     let rest = match path.strip_prefix('~') {
         Some("") => "",
         Some(rest) if rest.starts_with('/') => &rest[1..],
@@ -259,6 +286,30 @@ mod tests {
                 .starts_with("# mine\ninclude_adult = true # toggled with F2\nlanguage = \"fr\"\n")
         );
         assert!(saved.contains("quality = \"data-saver\""));
+        assert_eq!(Config::load(path).unwrap().settings, config.settings);
+    }
+
+    #[test]
+    fn saves_the_language_and_folder_and_updates_an_old_header() {
+        assert!(TEMPLATE.starts_with(TEMPLATE_HEADER));
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_path(&dir);
+        let old = TEMPLATE.replacen(TEMPLATE_HEADER, OLD_HEADER, 1);
+        write_atomically(&path, &old).unwrap();
+
+        let mut config = Config::load(path.clone()).unwrap();
+        config.settings.language = "es-la".to_owned();
+        config.settings.download_dir = "/mnt/books/manga".to_owned();
+        config.save().unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with(TEMPLATE_HEADER), "{saved}");
+        assert!(
+            saved.contains(
+                "# such as \"en\", \"es-la\", \"pt-br\" or \"fr\".\nlanguage = \"es-la\""
+            )
+        );
+        assert!(saved.contains("download_dir = \"/mnt/books/manga\""));
         assert_eq!(Config::load(path).unwrap().settings, config.settings);
     }
 

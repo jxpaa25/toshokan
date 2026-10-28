@@ -19,6 +19,12 @@ impl TextInput {
         &self.value
     }
 
+    /// Replaces the text, with the cursor at its end.
+    pub fn set(&mut self, value: &str) {
+        self.value = value.to_owned();
+        self.cursor = self.len();
+    }
+
     /// Applies an editing key. Returns false for keys the input doesn't handle.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

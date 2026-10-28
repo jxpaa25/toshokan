@@ -9,6 +9,7 @@ pub mod delete;
 pub mod link;
 pub mod pages;
 pub mod prepare;
+pub mod relocate;
 pub mod state;
 pub mod updates;
 

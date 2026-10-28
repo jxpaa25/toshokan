@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use super::cover::{CoverSource, cover_rect};
+use super::languages::language_name;
 use super::{groups_label, join_spans, key_hints, panel, rating_span, strip_link_section};
 use crate::api::{Chapter, ChapterSlot, Manga};
 use crate::app::Action;
@@ -581,72 +582,6 @@ fn chapter_item<'a>(
 
 fn group_label(upload: &Chapter) -> String {
     groups_label(&upload.groups)
-}
-
-/// English name for a MangaDex language code, or the code itself when unknown.
-fn language_name(code: &str) -> &str {
-    match code {
-        "en" => "English",
-        "ja" => "Japanese",
-        "ja-ro" => "Japanese (romaji)",
-        "ko" => "Korean",
-        "ko-ro" => "Korean (romanized)",
-        "zh" => "Chinese (simplified)",
-        "zh-hk" => "Chinese (traditional)",
-        "zh-ro" => "Chinese (romanized)",
-        "es" => "Spanish",
-        "es-la" => "Spanish (LATAM)",
-        "pt" => "Portuguese",
-        "pt-br" => "Portuguese (Brazil)",
-        "fr" => "French",
-        "de" => "German",
-        "it" => "Italian",
-        "nl" => "Dutch",
-        "ru" => "Russian",
-        "uk" => "Ukrainian",
-        "be" => "Belarusian",
-        "pl" => "Polish",
-        "cs" => "Czech",
-        "sk" => "Slovak",
-        "hu" => "Hungarian",
-        "ro" => "Romanian",
-        "bg" => "Bulgarian",
-        "sr" => "Serbian",
-        "hr" => "Croatian",
-        "el" => "Greek",
-        "tr" => "Turkish",
-        "ar" => "Arabic",
-        "fa" => "Persian",
-        "he" => "Hebrew",
-        "hi" => "Hindi",
-        "bn" => "Bengali",
-        "ne" => "Nepali",
-        "ta" => "Tamil",
-        "th" => "Thai",
-        "vi" => "Vietnamese",
-        "id" => "Indonesian",
-        "ms" => "Malay",
-        "tl" => "Filipino",
-        "my" => "Burmese",
-        "mn" => "Mongolian",
-        "kk" => "Kazakh",
-        "uz" => "Uzbek",
-        "az" => "Azerbaijani",
-        "ka" => "Georgian",
-        "lt" => "Lithuanian",
-        "lv" => "Latvian",
-        "et" => "Estonian",
-        "fi" => "Finnish",
-        "sv" => "Swedish",
-        "no" => "Norwegian",
-        "da" => "Danish",
-        "ca" => "Catalan",
-        "eu" => "Basque",
-        "gl" => "Galician",
-        "la" => "Latin",
-        "eo" => "Esperanto",
-        _ => code,
-    }
 }
 
 #[cfg(test)]

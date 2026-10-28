@@ -17,9 +17,10 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage, Tag};
-use crate::config::Config;
+use crate::config::{Config, expand_home};
 use crate::download::{self, Downloader, Job, OutputFormat, SavedQueue};
 use crate::library::delete::{self, Deletion};
+use crate::library::relocate::{self, MoveReport};
 use crate::library::state::{Direction, ReadingState};
 use crate::library::updates::{self, CheckEvent, Outcome};
 use crate::library::{self, LibraryManga};
@@ -31,6 +32,7 @@ use crate::ui::library::LibraryScreen;
 use crate::ui::manga::MangaScreen;
 use crate::ui::reader::{Fit, Graphics, PageLayout, ReaderResult, ReaderScreen};
 use crate::ui::search::{SearchRequest, SearchScreen};
+use crate::ui::settings::{Change, MoveDialog, SettingsScreen};
 use crate::ui::{display_path, format_size};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -74,6 +76,12 @@ pub enum Action {
         deletion: Deletion,
         /// The space it frees, to say so afterwards.
         size: u64,
+    },
+    ChangeSetting(Change),
+    /// Move these manga folders and loose chapters into the new download folder `to`.
+    MoveLibrary {
+        to: PathBuf,
+        entries: Vec<PathBuf>,
     },
     /// Check the library for chapters released on MangaDex since they were downloaded.
     CheckForNew,
@@ -159,12 +167,23 @@ pub enum Message {
         source: CoverSource,
         result: Result<RgbImage, String>,
     },
+    /// The library move started on entry `index` of `total`, called `name`.
+    Moving {
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    Moved {
+        to: PathBuf,
+        report: MoveReport,
+    },
 }
 
 /// A popup over the current screen, which gets the keys while it's open.
 enum Dialog {
     Download(DownloadDialog),
     Delete(DeleteDialog),
+    Move(MoveDialog),
 }
 
 /// A full-screen view shown over search and the manga screen, which keep their state.
@@ -173,6 +192,7 @@ enum Overlay {
     None,
     Library,
     Downloads,
+    Settings,
 }
 
 pub struct App {
@@ -194,6 +214,9 @@ pub struct App {
     manga_from_library: Option<PathBuf>,
     downloads: DownloadsScreen,
     library: LibraryScreen,
+    settings: SettingsScreen,
+    /// Set while the library moves to a new download folder.
+    moving: bool,
     overlay: Overlay,
     dialog: Option<Dialog>,
     /// Drawn over everything else while open.
@@ -207,6 +230,9 @@ pub struct App {
     check_generation: u64,
     /// The current check was asked for with u, so "nothing new" is worth saying.
     check_requested: bool,
+    /// The current check only re-links the library after its folder changed; its result
+    /// isn't announced, so it doesn't hide what the move said.
+    check_quiet: bool,
     running: bool,
     tick: usize,
 }
@@ -222,6 +248,7 @@ pub async fn run(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (update_tx, mut updates) = mpsc::unbounded_channel();
     let root = config.settings.download_root();
+    let config_path = config.path().to_owned();
     let downloader = Downloader::spawn(client.clone(), root.clone(), update_tx);
     let (reading, warning) = ReadingState::load(ReadingState::default_path());
     let mut app = App {
@@ -239,6 +266,11 @@ pub async fn run(
         manga: None,
         manga_from_library: None,
         library: LibraryScreen::new(root),
+        settings: SettingsScreen::new(
+            &config_path,
+            std::env::var_os("TOSHOKAN_DIR").map(PathBuf::from),
+        ),
+        moving: false,
         overlay: Overlay::None,
         dialog: None,
         reader: None,
@@ -247,6 +279,7 @@ pub async fn run(
         check_task: None,
         check_generation: 0,
         check_requested: false,
+        check_quiet: false,
         running: true,
         tick: 0,
     };
@@ -314,6 +347,9 @@ impl App {
         match self.overlay {
             Overlay::Library => self.library.render(frame, area, &self.reading, spinner),
             Overlay::Downloads => self.downloads.render(frame, area, spinner),
+            Overlay::Settings => self
+                .settings
+                .render(frame, area, &self.config.settings, spinner),
             Overlay::None => match &mut self.manga {
                 Some(manga) => manga.render(frame, area, spinner),
                 None => self
@@ -328,6 +364,7 @@ impl App {
         match &self.dialog {
             Some(Dialog::Download(dialog)) => dialog.render(frame, area),
             Some(Dialog::Delete(dialog)) => dialog.render(frame, area),
+            Some(Dialog::Move(dialog)) => dialog.render(frame, area),
             None => {}
         }
     }
@@ -340,7 +377,7 @@ impl App {
             self.terminal_output.extend(reader.take_output());
         }
         let wanted = match (&self.reader, self.overlay, &self.manga) {
-            (Some(_), _, _) | (None, Overlay::Downloads, _) => None,
+            (Some(_), _, _) | (None, Overlay::Downloads | Overlay::Settings, _) => None,
             (None, Overlay::Library, _) => self.library.cover(area),
             (None, Overlay::None, Some(manga)) => manga.cover(area),
             (None, Overlay::None, None) => self.search.cover(area),
@@ -392,6 +429,7 @@ impl App {
         self.search.is_loading()
             || self.manga.as_ref().is_some_and(MangaScreen::is_loading)
             || self.downloads.is_downloading()
+            || self.moving
             || (self.overlay == Overlay::Library && self.library.is_checking())
     }
 
@@ -423,6 +461,7 @@ impl App {
             match dialog {
                 Dialog::Download(dialog) => dialog.handle_key(key),
                 Dialog::Delete(dialog) => dialog.handle_key(key),
+                Dialog::Move(dialog) => dialog.handle_key(key),
             }
         } else if key.code == KeyCode::F(1) {
             self.toggle_overlay(Overlay::Library);
@@ -430,10 +469,14 @@ impl App {
         } else if key.code == KeyCode::F(3) {
             self.toggle_overlay(Overlay::Downloads);
             None
+        } else if key.code == KeyCode::F(5) {
+            self.toggle_overlay(Overlay::Settings);
+            None
         } else {
             match self.overlay {
                 Overlay::Library => self.library.handle_key(key, &self.reading),
                 Overlay::Downloads => self.downloads.handle_key(key),
+                Overlay::Settings => self.settings.handle_key(key, &self.config.settings),
                 Overlay::None => match &mut self.manga {
                     Some(manga) => manga.handle_key(key),
                     None => self.search.handle_key(key),
@@ -492,6 +535,10 @@ impl App {
             } => self.on_deleted(&deletion, size, result),
             Message::Tags(result) => self.search.on_tags(result),
             Message::Cover { source, result } => self.covers.on_loaded(source, result),
+            Message::Moving { index, total, name } => {
+                self.settings.set_moving(Some((index, total, name)))
+            }
+            Message::Moved { to, report } => self.on_moved(&to, report),
         }
     }
 
@@ -528,7 +575,7 @@ impl App {
         // The manga screen may show chapters of a folder that was just linked.
         self.refresh_downloaded();
         // Not worth interrupting reading for; the library shows it.
-        if self.reader.is_some() {
+        if self.reader.is_some() || self.check_quiet {
             return;
         }
         let count = self.library.with_new_chapters();
@@ -765,6 +812,25 @@ impl App {
                     });
                 });
             }
+            Action::ChangeSetting(change) => self.change_setting(change),
+            Action::MoveLibrary { to, entries } => {
+                self.dialog = None;
+                self.moving = true;
+                let first = entries
+                    .first()
+                    .map(|path| file_name(path))
+                    .unwrap_or_default();
+                self.settings.set_moving(Some((0, entries.len(), first)));
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let total = entries.len();
+                    let report = relocate::move_entries(&entries, &to, |index, name| {
+                        let name = name.to_owned();
+                        let _ = tx.send(Message::Moving { index, total, name });
+                    });
+                    let _ = tx.send(Message::Moved { to, report });
+                });
+            }
             Action::CheckForNew => self.check_for_new(true),
             Action::LookUpManga { id, then } => self.spawn_look_up(id, then),
             Action::ReadDownloaded { manga, chapter } => self.read_downloaded(&manga, &chapter),
@@ -819,6 +885,10 @@ impl App {
                     self.toggle_overlay(Overlay::Library);
                 }
             }
+            // Stopping halfway through a copy would leave a manga half in each folder.
+            Action::Quit if self.moving => self.notify(
+                "The library is still moving to the new folder; quit once it's done".to_owned(),
+            ),
             // Nothing is lost: the queue is saved and carries on next time.
             Action::Quit => self.running = false,
         }
@@ -852,6 +922,13 @@ impl App {
         self.dialog = Some(Dialog::Download(dialog.with_note(note)));
     }
 
+    /// Checks the library in a new folder, which links its manga for downloads, without
+    /// announcing what it finds.
+    fn relink_library(&mut self) {
+        self.check_for_new(false);
+        self.check_quiet = true;
+    }
+
     /// Starts checking the library for new chapters in the background, replacing any check
     /// still running.
     fn check_for_new(&mut self, requested: bool) {
@@ -860,6 +937,7 @@ impl App {
         }
         self.check_generation += 1;
         self.check_requested = requested;
+        self.check_quiet = false;
         let generation = self.check_generation;
         let client = self.client.clone();
         let tx = self.tx.clone();
@@ -902,6 +980,84 @@ impl App {
             },
             Err(err) => self.notify(format!("Couldn't read the manga folder: {err}")),
         }
+    }
+
+    fn change_setting(&mut self, change: Change) {
+        let settings = &mut self.config.settings;
+        match change {
+            Change::Language(code) => settings.language = code,
+            Change::Quality(quality) => settings.quality = quality,
+            Change::Format(format) => settings.format = format,
+            Change::DownloadDir(dir) => return self.change_download_dir(dir),
+        }
+        self.save_settings();
+    }
+
+    /// Switches to another download folder and offers to move the library there. Not while
+    /// chapters are downloading into the current one, or the library is moving.
+    fn change_download_dir(&mut self, dir: String) {
+        if self.moving {
+            return self.notify("Wait for the library to finish moving".to_owned());
+        }
+        let active = self.downloads.active_count();
+        if active > 0 {
+            let plural = if active == 1 { "" } else { "s" };
+            return self.notify(format!(
+                "{active} chapter{plural} still to download into the current folder; let them \
+                 finish or cancel them on F3 first"
+            ));
+        }
+        let old = self.downloader.root().to_owned();
+        let new = expand_home(&dir);
+        self.config.settings.download_dir = dir;
+        self.save_settings();
+        if new == old {
+            return;
+        }
+        self.downloader.set_root(new.clone());
+        self.library.set_root(new.clone(), &self.reading);
+        self.downloads.set_root(&old, &new);
+        self.save_queue();
+        self.covers.forget_local();
+        self.refresh_downloaded();
+        self.relink_library();
+        match relocate::movable(&old) {
+            Ok(entries) if !entries.is_empty() => {
+                self.dialog = Some(Dialog::Move(MoveDialog::new(old, new, entries)));
+            }
+            _ => self.notify(format!("Chapters now go to {}", display_path(&new))),
+        }
+    }
+
+    fn on_moved(&mut self, to: &std::path::Path, report: MoveReport) {
+        self.moving = false;
+        self.settings.set_moving(None);
+        self.library.rescan(&self.reading);
+        self.covers.forget_local();
+        self.refresh_downloaded();
+        self.relink_library();
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let mut notice = format!(
+            "Moved {} manga folder{} or chapter{} to {}",
+            report.moved,
+            plural(report.moved),
+            plural(report.moved),
+            display_path(to)
+        );
+        if !report.skipped.is_empty() {
+            notice.push_str(&format!(
+                " · left {} the new folder already had: {}",
+                report.skipped.len(),
+                report.skipped.join(", ")
+            ));
+        }
+        if let Some((name, err)) = report.failed.first() {
+            notice.push_str(&format!(
+                " · {} couldn't be moved and stayed (first: {name}: {err})",
+                report.failed.len()
+            ));
+        }
+        self.notify(notice);
     }
 
     fn save_settings(&mut self) {
@@ -974,6 +1130,7 @@ impl App {
         match self.overlay {
             Overlay::Library => self.library.set_notice(notice),
             Overlay::Downloads => self.downloads.set_notice(notice),
+            Overlay::Settings => self.settings.set_notice(notice),
             Overlay::None => match &mut self.manga {
                 Some(manga) => manga.set_notice(notice),
                 None => self.search.set_notice(notice),

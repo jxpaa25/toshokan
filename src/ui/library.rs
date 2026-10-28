@@ -71,6 +71,14 @@ impl LibraryScreen {
         }
     }
 
+    /// Shows the library in another download folder.
+    pub fn set_root(&mut self, root: PathBuf, state: &ReadingState) {
+        self.root = root;
+        self.checks.clear();
+        self.checking = None;
+        self.rescan(state);
+    }
+
     /// Re-reads the download folder, keeping the selected manga when it's still there, or
     /// else the place in the list.
     pub fn rescan(&mut self, state: &ReadingState) {

@@ -59,6 +59,17 @@ impl DownloadsScreen {
         }
     }
 
+    /// Shows another download folder as where chapters are saved, and points failed chapters
+    /// that were going into `old` at the same place in `new`, for when they're retried.
+    pub fn set_root(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        self.root = display_path(new);
+        for entry in &mut self.entries {
+            if let (State::Failed(_), Ok(rest)) = (&entry.state, entry.job.dir.strip_prefix(old)) {
+                entry.job.dir = new.join(rest);
+            }
+        }
+    }
+
     pub fn add(&mut self, job: Job) {
         self.push(job, State::Queued);
     }
@@ -451,6 +462,26 @@ mod tests {
 
         screen.handle_key(key(KeyCode::Char('x')));
         assert_eq!(screen.entries.len(), 2, "finished entries are cleared");
+    }
+
+    #[test]
+    fn a_new_folder_takes_the_failed_chapters_along() {
+        let mut screen = DownloadsScreen::new(std::path::Path::new("/tmp/manga"));
+        screen.add(job(1, "1"));
+        screen.on_update(update(1, Event::Failed("timed out".to_owned())));
+        screen.add(job(2, "2"));
+        screen.on_update(update(
+            2,
+            Event::Finished(PathBuf::from("/tmp/manga/2.cbz")),
+        ));
+        let new = std::path::Path::new("/mnt/books");
+        screen.set_root(std::path::Path::new("/tmp/manga"), new);
+        assert_eq!(screen.entries[0].job.dir, new.join("Berserk"));
+        assert_eq!(
+            screen.entries[1].job.dir,
+            PathBuf::from("/tmp/manga/Berserk")
+        );
+        assert!(draw(&mut screen).contains("Saving to /mnt/books"));
     }
 
     fn draw(screen: &mut DownloadsScreen) -> String {

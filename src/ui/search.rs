@@ -410,20 +410,20 @@ impl SearchScreen {
                 Focus::Input => &[
                     ("Enter", "search"),
                     ("F4", "filters"),
-                    ("Tab", "results"),
                     ("F2", "adult"),
                     ("F1", "library"),
                     ("F3", "downloads"),
+                    ("F5", "settings"),
                     ("Ctrl+C", "quit"),
                 ],
                 Focus::Results => &[
-                    ("↑↓", "move"),
                     ("Enter", "open"),
                     ("/", "search"),
                     ("f", "filters"),
                     ("F2", "adult"),
                     ("F1", "library"),
                     ("F3", "downloads"),
+                    ("F5", "settings"),
                     ("q", "quit"),
                 ],
             };

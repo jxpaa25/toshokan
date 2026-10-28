@@ -151,6 +151,13 @@ impl Downloader {
         &self.root
     }
 
+    /// Saves new manga into `root` from now on. Folders linked in the old one are forgotten;
+    /// the next library check links the new one's.
+    pub fn set_root(&mut self, root: PathBuf) {
+        self.root = root;
+        self.folders.clear();
+    }
+
     /// The folder named after the manga's title. When there's none, a folder linked to the
     /// manga instead, since its title on MangaDex may have changed since it was downloaded.
     pub fn manga_dir(&self, manga: &Manga) -> PathBuf {

@@ -7,10 +7,12 @@ pub mod downloads;
 pub mod filters;
 pub mod input;
 pub mod kitty;
+pub mod languages;
 pub mod library;
 pub mod manga;
 pub mod reader;
 pub mod search;
+pub mod settings;
 
 use std::path::Path;
 
