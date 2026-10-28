@@ -17,7 +17,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage};
 use crate::config::Config;
-use crate::download::{self, Downloader, Job, OutputFormat};
+use crate::download::{self, Downloader, Job, OutputFormat, SavedQueue};
 use crate::library::state::{Direction, ReadingState};
 use crate::library::updates::{self, CheckEvent, Outcome};
 use crate::library::{self, LibraryManga};
@@ -59,6 +59,9 @@ pub enum Action {
         dir: PathBuf,
     },
     Enqueue(Vec<Job>),
+    /// Stop these chapters downloading and delete the pages they saved.
+    CancelDownloads(Vec<Job>),
+    PauseDownloads(bool),
     /// Check the library for chapters released on MangaDex since they were downloaded.
     CheckForNew,
     /// Fetch a library manga's details from MangaDex, then do `then` with them.
@@ -149,6 +152,8 @@ pub struct App {
     config: Config,
     downloader: Downloader,
     next_job_id: u64,
+    /// Where the download queue is kept between runs.
+    queue_path: PathBuf,
     reading: ReadingState,
     graphics: Graphics,
     search: SearchScreen,
@@ -172,8 +177,6 @@ pub struct App {
     check_generation: u64,
     /// The current check was asked for with u, so "nothing new" is worth saying.
     check_requested: bool,
-    /// Set after a first quit request while downloads are running.
-    quit_armed: bool,
     running: bool,
     tick: usize,
 }
@@ -198,6 +201,7 @@ pub async fn run(
         downloads: DownloadsScreen::new(downloader.root()),
         downloader,
         next_job_id: 0,
+        queue_path: SavedQueue::default_path(),
         reading,
         graphics,
         search: SearchScreen::default(),
@@ -212,13 +216,13 @@ pub async fn run(
         check_task: None,
         check_generation: 0,
         check_requested: false,
-        quit_armed: false,
         running: true,
         tick: 0,
     };
     if let Some(warning) = warning {
         app.notify(warning);
     }
+    app.restore_queue();
     app.check_for_new(false);
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -320,7 +324,7 @@ impl App {
     fn is_busy(&self) -> bool {
         self.search.is_loading()
             || self.manga.as_ref().is_some_and(MangaScreen::is_loading)
-            || self.downloads.active_count() > 0
+            || self.downloads.is_downloading()
             || (self.overlay == Overlay::Library && self.library.is_checking())
     }
 
@@ -366,9 +370,6 @@ impl App {
                 },
             }
         };
-        if !matches!(action, Some(Action::Quit)) {
-            self.quit_armed = false;
-        }
         if let Some(action) = action {
             self.perform(action);
         }
@@ -492,7 +493,11 @@ impl App {
 
     fn handle_update(&mut self, update: download::Update) {
         let finished = matches!(update.event, download::Event::Finished(_));
+        let ended = !matches!(update.event, download::Event::Progress { .. });
         self.downloads.on_update(update);
+        if ended {
+            self.save_queue();
+        }
         if finished {
             self.refresh_downloaded();
             if self.overlay == Overlay::Library {
@@ -565,15 +570,19 @@ impl App {
                     self.downloads.add(job.clone());
                     self.downloader.enqueue(job);
                 }
+                self.save_queue();
                 if self.overlay == Overlay::None
                     && let Some(screen) = &mut self.manga
                 {
                     screen.clear_selection();
                 }
                 let plural = if count == 1 { "" } else { "s" };
-                self.notify(format!(
-                    "Queued {count} chapter{plural} · F3 shows downloads"
-                ));
+                let downloads = if self.downloads.is_paused() {
+                    "downloads are paused (p on F3 resumes)"
+                } else {
+                    "F3 shows downloads"
+                };
+                self.notify(format!("Queued {count} chapter{plural} · {downloads}"));
                 // Remember the choices so the next dialog starts with them.
                 let settings = &mut self.config.settings;
                 if (settings.quality, settings.format) != (quality, format) {
@@ -586,6 +595,17 @@ impl App {
                 for job in jobs {
                     self.downloader.enqueue(job);
                 }
+                self.save_queue();
+            }
+            Action::CancelDownloads(jobs) => {
+                for job in &jobs {
+                    self.downloader.cancel(job);
+                }
+                self.save_queue();
+            }
+            Action::PauseDownloads(paused) => {
+                self.downloader.set_paused(paused);
+                self.save_queue();
             }
             Action::CheckForNew => self.check_for_new(true),
             Action::LookUpManga { id, then } => self.spawn_look_up(id, then),
@@ -641,19 +661,8 @@ impl App {
                     self.toggle_overlay(Overlay::Library);
                 }
             }
-            Action::Quit => {
-                let active = self.downloads.active_count();
-                if active > 0 && !self.quit_armed {
-                    self.quit_armed = true;
-                    let plural = if active == 1 { "" } else { "s" };
-                    self.notify(format!(
-                        "{active} chapter{plural} still downloading. Press q again to quit; \
-                         partial chapters resume when downloaded again."
-                    ));
-                } else {
-                    self.running = false;
-                }
-            }
+            // Nothing is lost: the queue is saved and carries on next time.
+            Action::Quit => self.running = false,
         }
     }
 
@@ -741,6 +750,53 @@ impl App {
         if let Err(err) = self.config.save() {
             let path = display_path(self.config.path());
             self.notify(format!("Couldn't save settings to {path}: {err}"));
+        }
+    }
+
+    /// Puts back the chapters the last run left queued or failed. Queued ones start again
+    /// unless downloads were paused.
+    fn restore_queue(&mut self) {
+        let (saved, warning) = SavedQueue::load(&self.queue_path);
+        if let Some(warning) = warning {
+            self.notify(warning);
+        }
+        self.downloads.set_paused(saved.paused);
+        self.downloader.set_paused(saved.paused);
+        let (mut queued, mut failed) = (0, 0);
+        for chapter in saved.chapters {
+            self.next_job_id += 1;
+            let (job, error) = chapter.into_job(self.next_job_id);
+            if error.is_some() {
+                failed += 1;
+            } else {
+                queued += 1;
+                self.downloader.enqueue(job.clone());
+            }
+            self.downloads.restore(job, error);
+        }
+        let plural = |count| if count == 1 { "" } else { "s" };
+        let notice = match (queued, failed) {
+            (0, 0) => return,
+            (0, _) => format!(
+                "{failed} chapter{} failed to download last time · F3 to retry",
+                plural(failed)
+            ),
+            _ if saved.paused => format!(
+                "{queued} chapter download{} paused · F3 shows downloads",
+                plural(queued)
+            ),
+            _ => format!(
+                "Resuming {queued} chapter download{} · F3 shows downloads",
+                plural(queued)
+            ),
+        };
+        self.notify(notice);
+    }
+
+    fn save_queue(&mut self) {
+        if let Err(err) = self.downloads.saved().save(&self.queue_path) {
+            let path = display_path(&self.queue_path);
+            self.notify(format!("Couldn't save the download queue to {path}: {err}"));
         }
     }
 

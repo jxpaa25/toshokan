@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub type LocalizedString = HashMap<String, String>;
 
@@ -57,7 +57,7 @@ impl Relationship {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentRating {
     Safe,
@@ -112,7 +112,7 @@ pub(crate) struct MangaAttributes {
     pub available_translated_languages: Vec<Option<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manga {
     pub id: String,
     pub title: String,
@@ -196,7 +196,7 @@ pub(crate) struct ChapterAttributes {
     pub publish_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chapter {
     pub id: String,
     pub volume: Option<String>,
@@ -309,7 +309,7 @@ fn sort_key(number: Option<&str>) -> f64 {
         .unwrap_or(f64::INFINITY)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Quality {
     Data,

@@ -1,4 +1,5 @@
-//! Downloads screen: every queued chapter this session and how far along it is.
+//! Downloads screen: every chapter queued this session, or left queued or failed by the last
+//! one, and how far along it is.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -9,7 +10,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use super::{display_path, key_hints, panel, truncate_start};
 use crate::app::Action;
-use crate::download::{Event, Job, Update};
+use crate::download::{Event, Job, SavedChapter, SavedQueue, Update};
 
 const BAR_WIDTH: usize = 12;
 
@@ -41,6 +42,9 @@ pub struct DownloadsScreen {
     list: ListState,
     root: String,
     notice: Option<String>,
+    paused: bool,
+    /// Set after a first C, which asks for confirmation.
+    cancel_all_armed: bool,
 }
 
 impl DownloadsScreen {
@@ -50,17 +54,56 @@ impl DownloadsScreen {
             list: ListState::default(),
             root: display_path(root),
             notice: None,
+            paused: false,
+            cancel_all_armed: false,
         }
     }
 
     pub fn add(&mut self, job: Job) {
-        self.entries.push(Entry {
-            job,
-            state: State::Queued,
-        });
+        self.push(job, State::Queued);
+    }
+
+    /// Adds a chapter left by the last run: queued again, or failed with `error`.
+    pub fn restore(&mut self, job: Job, error: Option<String>) {
+        self.push(job, error.map_or(State::Queued, State::Failed));
+    }
+
+    fn push(&mut self, job: Job, state: State) {
+        self.entries.push(Entry { job, state });
         if self.list.selected().is_none() {
             self.list.select(Some(0));
         }
+    }
+
+    /// What the next run starts with: whether paused, and the chapters queued, downloading
+    /// or failed.
+    pub fn saved(&self) -> SavedQueue {
+        let chapters = self
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.state {
+                State::Queued | State::Running { .. } => Some(SavedChapter::new(&entry.job, None)),
+                State::Failed(err) => Some(SavedChapter::new(&entry.job, Some(err.clone()))),
+                State::Finished | State::AlreadyDownloaded => None,
+            })
+            .collect();
+        SavedQueue {
+            paused: self.paused,
+            chapters,
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// Whether a chapter is downloading or waiting to, and downloads aren't paused.
+    pub fn is_downloading(&self) -> bool {
+        !self.paused && self.active_count() > 0
     }
 
     pub fn on_update(&mut self, update: Update) {
@@ -89,6 +132,7 @@ impl DownloadsScreen {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        let cancel_all_confirmed = std::mem::take(&mut self.cancel_all_armed);
         let selected = self.list.selected().unwrap_or(0);
         let last = self.entries.len().saturating_sub(1);
         let cursor = match key.code {
@@ -98,11 +142,19 @@ impl DownloadsScreen {
             KeyCode::End | KeyCode::Char('G') => last,
             KeyCode::Char('r') => return self.retry(|index| index == selected),
             KeyCode::Char('R') => return self.retry(|_| true),
+            KeyCode::Char('c') | KeyCode::Delete => return self.cancel(selected),
+            KeyCode::Char('C') => return self.cancel_all(cancel_all_confirmed),
+            KeyCode::Char('p') => {
+                self.paused = !self.paused;
+                self.notice = Some(if self.paused {
+                    "Downloads paused · p resumes".to_owned()
+                } else {
+                    "Downloads resumed".to_owned()
+                });
+                return Some(Action::PauseDownloads(self.paused));
+            }
             KeyCode::Char('x') => {
-                self.entries.retain(|entry| !entry.is_complete());
-                let cursor = selected.min(self.entries.len().saturating_sub(1));
-                self.list
-                    .select((!self.entries.is_empty()).then_some(cursor));
+                self.remove(Entry::is_complete);
                 return None;
             }
             KeyCode::Esc | KeyCode::Backspace => return Some(Action::CloseOverlay),
@@ -111,6 +163,53 @@ impl DownloadsScreen {
         };
         self.list.select(Some(cursor));
         None
+    }
+
+    /// Cancels the selected chapter, deleting the pages it saved; a failed one is dropped
+    /// the same way. Saved chapters stay.
+    fn cancel(&mut self, selected: usize) -> Option<Action> {
+        let entry = self.entries.get(selected)?;
+        if entry.is_complete() {
+            self.notice = Some("Already saved · x clears finished chapters".to_owned());
+            return None;
+        }
+        let job = entry.job.clone();
+        self.remove(|entry| entry.job.id == job.id);
+        Some(Action::CancelDownloads(vec![job]))
+    }
+
+    /// Cancels everything queued or downloading, once confirmed with a second C.
+    fn cancel_all(&mut self, confirmed: bool) -> Option<Action> {
+        let count = self.active_count();
+        if count == 0 {
+            self.notice = Some("Nothing to cancel".to_owned());
+            return None;
+        }
+        if !confirmed {
+            self.cancel_all_armed = true;
+            let plural = if count == 1 { "" } else { "s" };
+            self.notice = Some(format!(
+                "Cancel {count} chapter{plural} and delete their pages? Press C again"
+            ));
+            return None;
+        }
+        let jobs = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .map(|entry| entry.job.clone())
+            .collect();
+        self.remove(Entry::is_active);
+        Some(Action::CancelDownloads(jobs))
+    }
+
+    /// Removes the entries matching `which`, keeping the cursor in the list.
+    fn remove(&mut self, which: impl Fn(&Entry) -> bool) {
+        let selected = self.list.selected().unwrap_or(0);
+        self.entries.retain(|entry| !which(entry));
+        let cursor = selected.min(self.entries.len().saturating_sub(1));
+        self.list
+            .select((!self.entries.is_empty()).then_some(cursor));
     }
 
     /// Re-queues failed entries matching `which`. Pages already saved are kept.
@@ -129,6 +228,38 @@ impl DownloadsScreen {
         Some(Action::Enqueue(jobs))
     }
 
+    /// The keys that do something right now, so the line fits.
+    fn hints(&self, complete: usize, failed: usize) -> Vec<(&'static str, &'static str)> {
+        let active = self.active_count();
+        let selected = self
+            .list
+            .selected()
+            .and_then(|index| self.entries.get(index));
+        let mut hints = Vec::new();
+        if selected.is_some_and(|entry| matches!(entry.state, State::Failed(_))) {
+            hints.push(("r", "retry"));
+        }
+        if failed > 1 {
+            hints.push(("R", "retry all"));
+        }
+        if selected.is_some_and(|entry| !entry.is_complete()) {
+            hints.push(("c", "cancel"));
+        }
+        if active > 1 {
+            hints.push(("C", "cancel all"));
+        }
+        if self.paused {
+            hints.push(("p", "resume"));
+        } else if active > 0 {
+            hints.push(("p", "pause"));
+        }
+        if complete > 0 {
+            hints.push(("x", "clear finished"));
+        }
+        hints.extend([("Esc", "back"), ("q", "quit")]);
+        hints
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect, spinner: &str) {
         let [body, footer] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
@@ -143,7 +274,9 @@ impl DownloadsScreen {
         if failed > 0 {
             title.push_str(&format!("· {failed} failed "));
         }
-        if self.active_count() > 0 {
+        if self.paused {
+            title.push_str("· paused ");
+        } else if self.active_count() > 0 {
             title.push_str(&format!("{spinner} "));
         }
         let root = truncate_start(&self.root, (area.width as usize).saturating_sub(15));
@@ -165,7 +298,7 @@ impl DownloadsScreen {
             let items: Vec<ListItem> = self
                 .entries
                 .iter()
-                .map(|entry| entry_item(entry, spinner))
+                .map(|entry| entry_item(entry, spinner, self.paused))
                 .collect();
             let list = List::new(items)
                 .block(block)
@@ -180,22 +313,19 @@ impl DownloadsScreen {
 
         let status = match &self.notice {
             Some(notice) => Line::from(notice.as_str().yellow()),
-            None => key_hints(&[
-                ("r", "retry"),
-                ("R", "retry all"),
-                ("x", "clear finished"),
-                ("F1", "library"),
-                ("Esc", "back"),
-                ("q", "quit"),
-            ]),
+            None => key_hints(&self.hints(complete, failed)),
         };
         frame.render_widget(Paragraph::new(status), footer);
     }
 }
 
-fn entry_item<'a>(entry: &'a Entry, spinner: &'a str) -> ListItem<'a> {
+fn entry_item<'a>(entry: &'a Entry, spinner: &'a str, paused: bool) -> ListItem<'a> {
     let status: Vec<Span> = match &entry.state {
         State::Queued => vec!["· queued".dark_gray()],
+        State::Running { done, total } if paused => vec![
+            Span::raw(format!("‖ {}", progress_bar(*done, *total))).dark_gray(),
+            Span::raw(format!(" {done}/{total}")),
+        ],
         State::Running { done, total } => vec![
             Span::raw(format!("{spinner} ")).cyan(),
             Span::raw(progress_bar(*done, *total)).cyan(),
@@ -314,5 +444,81 @@ mod tests {
 
         screen.handle_key(key(KeyCode::Char('x')));
         assert_eq!(screen.entries.len(), 2, "finished entries are cleared");
+    }
+
+    fn draw(screen: &mut DownloadsScreen) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), "⠋"))
+            .unwrap();
+        buffer_text(&terminal)
+    }
+
+    fn cancelled(action: Option<Action>) -> Vec<u64> {
+        match action {
+            Some(Action::CancelDownloads(jobs)) => jobs.iter().map(|job| job.id).collect(),
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pauses_cancels_and_remembers_the_queue() {
+        let mut screen = DownloadsScreen::new(std::path::Path::new("/tmp/manga"));
+        screen.add(job(1, "1"));
+        screen.add(job(2, "2"));
+        screen.restore(job(3, "3"), Some("2 of 10 pages failed".to_owned()));
+        screen.add(job(4, "4"));
+        screen.on_update(update(1, Event::Progress { done: 6, total: 12 }));
+        assert!(screen.is_downloading());
+        let text = draw(&mut screen);
+        assert!(text.contains("c cancel  C cancel all  p pause"));
+
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('p'))),
+            Some(Action::PauseDownloads(true))
+        ));
+        assert!(!screen.is_downloading());
+        screen.handle_key(key(KeyCode::Down));
+        let text = draw(&mut screen);
+        assert!(text.contains("Downloads · 0/4 done · 1 failed · paused"));
+        assert!(text.contains("‖ ██████░░░░░░ 6/12"), "{text}");
+        assert!(text.contains("p resume"));
+
+        let saved = screen.saved();
+        assert!(saved.paused);
+        let errors: Vec<_> = saved
+            .chapters
+            .iter()
+            .map(|chapter| chapter.error.as_deref())
+            .collect();
+        assert_eq!(errors, [None, None, Some("2 of 10 pages failed"), None]);
+
+        assert_eq!(cancelled(screen.handle_key(key(KeyCode::Char('c')))), [2]);
+        assert_eq!(cancelled(screen.handle_key(key(KeyCode::Delete))), [3]);
+        assert_eq!(screen.entries.len(), 2);
+
+        // Cancelling everything asks first, and any other key calls it off.
+        assert!(screen.handle_key(key(KeyCode::Char('C'))).is_none());
+        assert!(
+            draw(&mut screen).contains("Cancel 2 chapters and delete their pages? Press C again")
+        );
+        screen.handle_key(key(KeyCode::Up));
+        assert!(screen.handle_key(key(KeyCode::Char('C'))).is_none());
+        assert_eq!(
+            cancelled(screen.handle_key(key(KeyCode::Char('C')))),
+            [1, 4]
+        );
+        assert!(screen.entries.is_empty());
+        assert!(screen.saved().chapters.is_empty());
+
+        // Chapters already saved aren't cancelled; that's for the library.
+        screen.add(job(5, "5"));
+        screen.on_update(update(
+            5,
+            Event::Finished(PathBuf::from("/tmp/manga/5.cbz")),
+        ));
+        assert!(screen.handle_key(key(KeyCode::Char('c'))).is_none());
+        assert!(draw(&mut screen).contains("Already saved · x clears finished chapters"));
+        assert!(screen.saved().chapters.is_empty());
     }
 }

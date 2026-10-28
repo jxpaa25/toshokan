@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use toml_edit::{DocumentMut, Value};
 
 use crate::api::Quality;
@@ -153,6 +154,39 @@ fn set(doc: &mut DocumentMut, key: &str, mut value: Value) {
             *existing = value;
         }
         None => doc[key] = toml_edit::Item::Value(value),
+    }
+}
+
+/// A file in the app's data folder (`~/.local/share/toshokan` on Linux).
+pub fn data_path(file: &str) -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("toshokan")
+        .join(file)
+}
+
+/// Reads the JSON at `path`; a missing file gives the default. An unreadable one is moved
+/// aside to `<file>.bak` and replaced with the default, and the returned warning says so.
+pub(crate) fn load_json<T: DeserializeOwned + Default>(
+    path: &Path,
+    what: &str,
+) -> (T, Option<String>) {
+    let parsed = match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|err| err.to_string()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        Err(err) => Err(err.to_string()),
+    };
+    match parsed {
+        Ok(value) => (value, None),
+        Err(err) => {
+            let backup = path.with_extension("json.bak");
+            let _ = fs::rename(path, &backup);
+            let warning = format!(
+                "{what} couldn't be loaded ({err}); the old file was moved to {}",
+                backup.display()
+            );
+            (T::default(), Some(warning))
+        }
     }
 }
 

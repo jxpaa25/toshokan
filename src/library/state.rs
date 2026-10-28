@@ -2,13 +2,12 @@
 //! data folder (`~/.local/share/toshokan/library.json` on Linux).
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::write_atomically;
+use crate::config::{data_path, load_json, write_atomically};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,38 +60,14 @@ pub struct ReadingState {
 
 impl ReadingState {
     pub fn default_path() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("toshokan")
-            .join("library.json")
+        data_path("library.json")
     }
 
     /// Loads the state at `path`. An unreadable file is moved aside to `library.json.bak`
     /// and replaced with an empty state; the returned warning says so.
     pub fn load(path: PathBuf) -> (Self, Option<String>) {
-        let parsed = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|err| err.to_string()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(err) => Err(err.to_string()),
-        };
-        match parsed {
-            Ok(manga) => (ReadingState { path, manga }, None),
-            Err(err) => {
-                let backup = path.with_extension("json.bak");
-                let _ = fs::rename(&path, &backup);
-                let warning = format!(
-                    "Reading progress couldn't be loaded ({err}); the old file was moved to {}",
-                    backup.display()
-                );
-                (
-                    ReadingState {
-                        path,
-                        manga: BTreeMap::new(),
-                    },
-                    Some(warning),
-                )
-            }
-        }
+        let (manga, warning) = load_json(&path, "Reading progress");
+        (ReadingState { path, manga }, warning)
     }
 
     pub fn path(&self) -> &Path {
@@ -179,7 +154,7 @@ mod tests {
     fn moves_a_corrupt_file_aside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("library.json");
-        fs::write(&path, "{not json").unwrap();
+        std::fs::write(&path, "{not json").unwrap();
         let (state, warning) = ReadingState::load(path.clone());
         assert!(warning.unwrap().contains("library.json.bak"));
         assert_eq!(state.direction("x"), Direction::Rtl);
