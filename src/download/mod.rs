@@ -165,6 +165,11 @@ impl Downloader {
     pub fn link_folder(&mut self, manga_id: &str, dir: PathBuf) {
         self.folders.insert(manga_id.to_owned(), dir);
     }
+
+    /// Forgets a manga folder that was deleted.
+    pub fn forget_folder(&mut self, dir: &Path) {
+        self.folders.retain(|_, linked| linked != dir);
+    }
 }
 
 /// The queue, shared by the [`Downloader`] and its worker.
@@ -501,12 +506,21 @@ async fn delete_partial_files(job: Job) {
 /// Records which MangaDex manga the folder holds, so the library can check it for new
 /// chapters. Best effort, like the cover.
 async fn save_link(manga_dir: &Path, job: &Job) {
-    let link = MangaLink {
-        id: job.manga.id.clone(),
-        language: job.chapter.language.clone(),
-    };
+    let (id, language) = (job.manga.id.clone(), job.chapter.language.clone());
     let dir = manga_dir.to_owned();
-    let _ = tokio::task::spawn_blocking(move || link.save(&dir)).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        // Keeps the newest chapter from before chapters were deleted.
+        let newest_chapter = MangaLink::load(&dir)
+            .filter(|link| link.id == id)
+            .and_then(|link| link.newest_chapter);
+        let link = MangaLink {
+            id,
+            language,
+            newest_chapter,
+        };
+        link.save(&dir)
+    })
+    .await;
 }
 
 /// Saves the series cover as `cover.<ext>` next to the chapters, which readers like Mihon
@@ -842,6 +856,28 @@ mod tests {
         );
         assert_eq!(queue(&downloader), (vec![2], None));
         assert_eq!(source.fetches(), 0);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_newest_chapter_in_the_link() {
+        let library = tempfile::tempdir().unwrap();
+        let source = FakeSource::new(1);
+        source.release(1);
+        let (downloader, mut events) = start(&source, library.path());
+        let job = job(1, library.path(), "1", OutputFormat::Folder);
+        let link = MangaLink {
+            id: "m1".to_owned(),
+            language: "es".to_owned(),
+            newest_chapter: Some("Ch. 0009 [TAMT]".to_owned()),
+        };
+        std::fs::create_dir_all(&job.dir).unwrap();
+        link.save(&job.dir).unwrap();
+
+        downloader.enqueue(job.clone());
+        until_finished(&mut events, 1).await;
+        let saved = MangaLink::load(&job.dir).unwrap();
+        assert_eq!(saved.language, "en", "the latest download's language");
+        assert_eq!(saved.newest_chapter.as_deref(), Some("Ch. 0009 [TAMT]"));
     }
 
     #[tokio::test]

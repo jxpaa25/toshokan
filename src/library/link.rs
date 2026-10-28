@@ -17,6 +17,10 @@ pub struct MangaLink {
     pub id: String,
     /// The translation of the latest download, which is the one checked for new chapters.
     pub language: String,
+    /// The name of the newest chapter the folder has held, saved when chapters are deleted:
+    /// new chapters are counted from it, and the manga stays in the library with none left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_chapter: Option<String>,
 }
 
 impl MangaLink {
@@ -49,6 +53,7 @@ mod tests {
         let link = MangaLink {
             id: "m1".to_owned(),
             language: "en".to_owned(),
+            newest_chapter: None,
         };
         link.save(dir.path()).unwrap();
         assert_eq!(MangaLink::load(dir.path()), Some(link));

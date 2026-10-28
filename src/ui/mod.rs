@@ -1,5 +1,6 @@
 //! Screens and the drawing helpers they share.
 
+pub mod delete_dialog;
 pub mod download_dialog;
 pub mod downloads;
 pub mod input;
@@ -105,6 +106,22 @@ pub(crate) fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// A size the way file managers show it, e.g. "820 KB", "2.4 MB", "130 MB", "1.2 GB".
+pub(crate) fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    let mb = bytes / KB / KB;
+    if mb < 1.0 {
+        format!("{} KB", (bytes / KB).ceil())
+    } else if mb < 10.0 {
+        format!("{mb:.1} MB")
+    } else if mb < KB {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{:.1} GB", mb / KB)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buffer = terminal.backend().buffer();
@@ -115,4 +132,18 @@ pub(crate) fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBac
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_sizes() {
+        assert_eq!(format_size(0), "0 KB");
+        assert_eq!(format_size(1500), "2 KB");
+        assert_eq!(format_size(2_500_000), "2.4 MB");
+        assert_eq!(format_size(136_000_000), "130 MB");
+        assert_eq!(format_size(1_300_000_000), "1.2 GB");
+    }
 }

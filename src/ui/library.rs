@@ -1,7 +1,7 @@
 //! Library screen: manga in the download folder and their chapters, with reading progress
-//! and the chapters released on MangaDex since.
+//! and the chapters released on MangaDex since. Chapters and manga are deleted from here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -13,9 +13,10 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::{display_path, groups_label, key_hints, panel, truncate_start};
 use crate::app::{Action, LookUp};
+use crate::library::delete::Deletion;
 use crate::library::state::ReadingState;
 use crate::library::updates::{Found, NewChapter, Outcome};
-use crate::library::{self, LibraryManga};
+use crate::library::{self, LibraryManga, LocalChapter};
 
 /// Rows of new chapters listed under a manga's chapters before the rest are summed up.
 const NEW_ROWS: usize = 6;
@@ -45,6 +46,8 @@ pub struct LibraryScreen {
     checks: HashMap<String, Check>,
     /// Manga checked so far and in total, while a check runs.
     checking: Option<(usize, usize)>,
+    /// File names of the selected manga's chapters marked for deleting.
+    marked: HashSet<String>,
 }
 
 impl LibraryScreen {
@@ -59,12 +62,15 @@ impl LibraryScreen {
             notice: None,
             checks: HashMap::new(),
             checking: None,
+            marked: HashSet::new(),
         }
     }
 
-    /// Re-reads the download folder, keeping the selected manga when it's still there.
+    /// Re-reads the download folder, keeping the selected manga when it's still there, or
+    /// else the place in the list.
     pub fn rescan(&mut self, state: &ReadingState) {
         let selected_key = self.selected_manga().map(|m| m.key.clone());
+        let previous = self.manga_list.selected().unwrap_or(0);
         match library::scan(&self.root) {
             Ok(manga) => {
                 self.manga = manga;
@@ -75,9 +81,15 @@ impl LibraryScreen {
                 self.error = Some(err.to_string());
             }
         }
-        let index = selected_key
-            .and_then(|key| self.manga.iter().position(|m| m.key == key))
-            .unwrap_or(0);
+        let kept = selected_key.and_then(|key| self.manga.iter().position(|m| m.key == key));
+        let index = kept.unwrap_or(previous.min(self.manga.len().saturating_sub(1)));
+        match kept.and_then(|index| self.manga.get(index)) {
+            Some(manga) => {
+                let names: HashSet<&String> = manga.chapters.iter().map(|c| &c.file_name).collect();
+                self.marked.retain(|name| names.contains(name));
+            }
+            None => self.marked.clear(),
+        }
         if self.manga.is_empty() {
             self.manga_list.select(None);
             self.focus = Focus::Manga;
@@ -98,6 +110,9 @@ impl LibraryScreen {
         if let Some((manga, chapter)) = selected {
             self.show_chapter(&manga, &chapter);
             self.focus = focus;
+        }
+        if self.chapter_list.selected().is_none() {
+            self.focus = Focus::Manga;
         }
     }
 
@@ -161,14 +176,23 @@ impl LibraryScreen {
     /// Selects a manga and points its chapter list at the first unread chapter.
     fn select_manga(&mut self, index: usize, state: &ReadingState) {
         self.manga_list.select(Some(index));
-        let chapter = self.manga.get(index).map(|manga| {
-            manga
-                .chapters
-                .iter()
-                .position(|c| !is_read(state, manga, &c.file_name))
-                .unwrap_or(0)
-        });
+        let chapter = self
+            .manga
+            .get(index)
+            .filter(|manga| !manga.chapters.is_empty())
+            .map(|manga| {
+                manga
+                    .chapters
+                    .iter()
+                    .position(|c| !is_read(state, manga, &c.file_name))
+                    .unwrap_or(0)
+            });
         self.chapter_list.select(chapter);
+    }
+
+    /// Forgets what the last check found for a manga that was deleted.
+    pub fn forget(&mut self, manga_key: &str) {
+        self.checks.remove(manga_key);
     }
 
     /// Moves the selection to a chapter, e.g. the one just closed in the reader.
@@ -176,6 +200,9 @@ impl LibraryScreen {
         let Some(manga) = self.manga.iter().position(|m| m.key == manga_key) else {
             return;
         };
+        if self.manga_list.selected() != Some(manga) {
+            self.marked.clear();
+        }
         let chapter = self.manga[manga]
             .chapters
             .iter()
@@ -199,6 +226,8 @@ impl LibraryScreen {
             KeyCode::Char('u') => return Some(Action::CheckForNew),
             KeyCode::Char('d') => self.download_new(),
             KeyCode::Char('m') => self.open_online(),
+            KeyCode::Char('c') => return self.continue_reading(state),
+            KeyCode::Char('x') | KeyCode::Delete => return self.delete(),
             _ => None,
         };
         if let Some(online) = online {
@@ -228,10 +257,22 @@ impl LibraryScreen {
                     }
                     _ => return None,
                 };
+                // Marks are for one manga's chapters.
+                if index != selected {
+                    self.marked.clear();
+                }
                 self.select_manga(index, state);
                 None
             }
             Focus::Chapters => {
+                // Also from a manga with no chapters left, so before needing a selection.
+                if matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
+                ) {
+                    self.focus = Focus::Manga;
+                    return None;
+                }
                 let manga = self.selected_manga()?;
                 let selected = self.chapter_list.selected()?;
                 let last = manga.chapters.len() - 1;
@@ -248,8 +289,20 @@ impl LibraryScreen {
                             chapter: selected,
                         });
                     }
-                    KeyCode::Tab | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                        self.focus = Focus::Manga;
+                    KeyCode::Char(' ') => {
+                        let name = manga.chapters[selected].file_name.clone();
+                        if !self.marked.remove(&name) {
+                            self.marked.insert(name);
+                        }
+                        (selected + 1).min(last)
+                    }
+                    KeyCode::Char('a') => {
+                        if self.marked.len() == manga.chapters.len() {
+                            self.marked.clear();
+                        } else {
+                            self.marked =
+                                manga.chapters.iter().map(|c| c.file_name.clone()).collect();
+                        }
                         return None;
                     }
                     _ => return None,
@@ -258,6 +311,56 @@ impl LibraryScreen {
                 None
             }
         }
+    }
+
+    /// Opens the selected manga where it was left: the furthest chapter partway through,
+    /// else the first unread one.
+    fn continue_reading(&mut self, state: &ReadingState) -> Option<Action> {
+        let manga = self.selected_manga()?.clone();
+        let progress = |chapter: &LocalChapter| state.progress(&manga.key, &chapter.file_name);
+        let chapter = manga
+            .chapters
+            .iter()
+            .rposition(|c| progress(c).is_some_and(|p| !p.read && p.page > 0))
+            .or_else(|| {
+                manga
+                    .chapters
+                    .iter()
+                    .position(|c| !progress(c).is_some_and(|p| p.read))
+            });
+        let Some(chapter) = chapter else {
+            self.notice = Some(if manga.chapters.is_empty() {
+                format!("No chapters of {} on disk", manga.title)
+            } else {
+                format!("Every chapter of {} is read", manga.title)
+            });
+            return None;
+        };
+        self.chapter_list.select(Some(chapter));
+        self.focus = Focus::Chapters;
+        Some(Action::OpenReader { manga, chapter })
+    }
+
+    /// Asks to delete the selected manga, or the chapters marked in it.
+    fn delete(&mut self) -> Option<Action> {
+        let manga = self.selected_manga()?.clone();
+        let deletion = match self.focus {
+            Focus::Manga => Deletion::Manga(manga),
+            Focus::Chapters => {
+                let chapters: Vec<LocalChapter> = manga
+                    .chapters
+                    .iter()
+                    .filter(|c| self.marked.contains(&c.file_name))
+                    .cloned()
+                    .collect();
+                if chapters.is_empty() {
+                    self.notice = Some("Mark chapters with Space (or a for all) first".to_owned());
+                    return None;
+                }
+                Deletion::Chapters { manga, chapters }
+            }
+        };
+        Some(Action::ConfirmDelete(deletion))
     }
 
     /// Queues the selected manga's new chapters by the group of its newest chapter. Returns
@@ -374,7 +477,11 @@ impl LibraryScreen {
             self.render_manga(frame, manga_area, state, spinner);
             let status = self.check_status();
             let used = 2 + status.as_ref().map_or(0, |status| status.width() + 1);
-            let mut block = panel(" Chapters ", self.focus == Focus::Chapters).title_bottom(
+            let title = match self.marked.len() {
+                0 => " Chapters ".to_owned(),
+                marked => format!(" Chapters · {marked} marked "),
+            };
+            let mut block = panel(&title, self.focus == Focus::Chapters).title_bottom(
                 reading_from((chapters_area.width as usize).saturating_sub(used)),
             );
             if let Some(status) = status {
@@ -385,18 +492,27 @@ impl LibraryScreen {
 
         let status = match &self.notice {
             Some(notice) => Line::from(notice.as_str().yellow()),
-            None => key_hints(&[
-                ("Enter", "read"),
-                ("d", "download new"),
-                ("m", "MangaDex page"),
-                ("u", "check for new"),
-                ("Tab", "switch pane"),
-                ("F3", "downloads"),
-                ("Esc", "back"),
-                ("q", "quit"),
-            ]),
+            None => key_hints(&self.hints()),
         };
         frame.render_widget(Paragraph::new(status), footer);
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        let mut hints = match self.focus {
+            Focus::Manga => vec![("Enter", "chapters"), ("c", "continue"), ("x", "delete")],
+            Focus::Chapters if self.marked.is_empty() => {
+                vec![("Enter", "read"), ("c", "continue"), ("Space", "mark")]
+            }
+            Focus::Chapters => vec![("Enter", "read"), ("Space", "mark"), ("x", "delete marked")],
+        };
+        hints.extend([
+            ("d", "download new"),
+            ("m", "MangaDex page"),
+            ("u", "check for new"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ]);
+        hints
     }
 
     /// What the check said about the selected manga, unless it found new chapters, which
@@ -431,7 +547,9 @@ impl LibraryScreen {
                 let count = manga.chapters.len();
                 let plural = if count == 1 { "" } else { "s" };
                 let mut summary = format!("{count} chapter{plural}");
-                if unread > 0 && unread < count {
+                if count == 0 {
+                    summary = "no chapters on disk".to_owned();
+                } else if unread > 0 && unread < count {
                     summary.push_str(&format!(" · {unread} unread"));
                 } else if unread == 0 {
                     summary.push_str(" · all read");
@@ -496,6 +614,21 @@ impl LibraryScreen {
             }
             None => area,
         };
+        if manga.chapters.is_empty() {
+            let message = vec![
+                Line::from("No chapters on disk."),
+                Line::from(
+                    "It's still checked for new chapters, which show up here; x on the manga \
+                     deletes it for good."
+                        .dark_gray(),
+                ),
+            ];
+            let paragraph = Paragraph::new(message)
+                .wrap(Wrap { trim: true })
+                .block(block);
+            frame.render_widget(paragraph, area);
+            return;
+        }
         let items: Vec<ListItem> = manga
             .chapters
             .iter()
@@ -507,7 +640,16 @@ impl LibraryScreen {
                     Some(p) if p.page > 0 => format!("p. {:<4} ", p.page + 1).cyan(),
                     _ => "        ".into(),
                 };
-                ListItem::new(Line::from(vec![status, Span::raw(chapter.name.as_str())]))
+                let mut spans = vec![status, Span::raw(chapter.name.as_str())];
+                if !self.marked.is_empty() {
+                    let mark = if self.marked.contains(&chapter.file_name) {
+                        "✗ ".red().bold()
+                    } else {
+                        "  ".into()
+                    };
+                    spans.insert(0, mark);
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
         frame.render_stateful_widget(list(items, block), area, &mut self.chapter_list);
@@ -635,6 +777,150 @@ mod tests {
         }
     }
 
+    /// Berserk with chapters 1 to 4 and Akira with one, in `dir`.
+    fn two_manga(dir: &std::path::Path) {
+        let files = (1..=4)
+            .map(|n| format!("Berserk/Ch. {n:04}.cbz"))
+            .chain(["Akira/Ch. 0001.cbz".to_owned()]);
+        for file in files {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"").unwrap();
+        }
+    }
+
+    fn opened(action: Option<Action>) -> usize {
+        match action {
+            Some(Action::OpenReader { chapter, .. }) => chapter,
+            other => panic!("expected the reader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continues_where_the_manga_was_left() {
+        let dir = tempfile::tempdir().unwrap();
+        two_manga(dir.path());
+        let (mut state, _) = ReadingState::load(dir.path().join("state.json"));
+        let mut screen = LibraryScreen::new(dir.path().to_owned());
+        screen.rescan(&state);
+        screen.handle_key(key(KeyCode::Down), &state);
+
+        state.record("Berserk", "Ch. 0001.cbz", 20, true);
+        assert_eq!(
+            opened(screen.handle_key(key(KeyCode::Char('c')), &state)),
+            1
+        );
+        // A chapter left partway counts first, even past unread ones.
+        state.record("Berserk", "Ch. 0003.cbz", 5, false);
+        assert_eq!(
+            opened(screen.handle_key(key(KeyCode::Char('c')), &state)),
+            2
+        );
+        assert_eq!(screen.focus, Focus::Chapters);
+        assert_eq!(screen.chapter_list.selected(), Some(2));
+
+        for chapter in ["Ch. 0002.cbz", "Ch. 0003.cbz", "Ch. 0004.cbz"] {
+            state.record("Berserk", chapter, 20, true);
+        }
+        assert!(screen.handle_key(key(KeyCode::Char('c')), &state).is_none());
+        assert!(render(&mut screen, &state).contains("Every chapter of Berserk is read"));
+    }
+
+    #[test]
+    fn marks_chapters_and_asks_before_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        two_manga(dir.path());
+        let (state, _) = ReadingState::load(dir.path().join("state.json"));
+        let mut screen = LibraryScreen::new(dir.path().to_owned());
+        screen.rescan(&state);
+        let press = |screen: &mut LibraryScreen, code| screen.handle_key(key(code), &state);
+
+        match press(&mut screen, KeyCode::Char('x')) {
+            Some(Action::ConfirmDelete(Deletion::Manga(manga))) => assert_eq!(manga.key, "Akira"),
+            other => panic!("expected to delete Akira, got {other:?}"),
+        }
+        press(&mut screen, KeyCode::Down);
+        press(&mut screen, KeyCode::Enter);
+        assert!(press(&mut screen, KeyCode::Char('x')).is_none());
+        assert!(
+            render(&mut screen, &state).contains("Mark chapters with Space (or a for all) first")
+        );
+
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Down);
+        press(&mut screen, KeyCode::Char(' '));
+        let text = render(&mut screen, &state);
+        assert!(text.contains("Chapters · 2 marked"), "{text}");
+        assert!(text.contains("✗         Ch. 0001"));
+        assert!(text.contains("          Ch. 0002"));
+        assert!(text.contains("x delete marked"));
+        match press(&mut screen, KeyCode::Delete) {
+            Some(Action::ConfirmDelete(Deletion::Chapters { manga, chapters })) => {
+                assert_eq!(manga.key, "Berserk");
+                let names: Vec<_> = chapters.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(names, ["Ch. 0001", "Ch. 0003"]);
+            }
+            other => panic!("expected to delete two chapters, got {other:?}"),
+        }
+
+        press(&mut screen, KeyCode::Char('a'));
+        assert_eq!(screen.marked.len(), 4);
+        press(&mut screen, KeyCode::Char('a'));
+        assert!(screen.marked.is_empty());
+
+        // Marks belong to one manga.
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Tab);
+        press(&mut screen, KeyCode::Up);
+        assert!(screen.marked.is_empty());
+    }
+
+    #[test]
+    fn keeps_a_followed_manga_with_no_chapters_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let berserk = dir.path().join("Berserk");
+        fs::create_dir(&berserk).unwrap();
+        let link = MangaLink {
+            id: "m1".to_owned(),
+            language: "en".to_owned(),
+            newest_chapter: Some("Ch. 0002 [B]".to_owned()),
+        };
+        link.save(&berserk).unwrap();
+        let (state, _) = ReadingState::load(dir.path().join("state.json"));
+        let mut screen = LibraryScreen::new(dir.path().to_owned());
+        screen.rescan(&state);
+        let text = render(&mut screen, &state);
+        assert!(text.contains("no chapters on disk"), "{text}");
+        assert!(text.contains("It's still checked for new chapters"));
+
+        let slots = vec![slot("3", vec![upload("3b", "3", "B")])];
+        let found = updates::compare(&[], slots, link);
+        screen.on_checked("Berserk".to_owned(), Ok(Outcome::Found(found)));
+        let text = render(&mut screen, &state);
+        assert!(text.contains("no chapters on disk · 1 new"));
+        assert!(text.contains("1 new on MangaDex"));
+        match screen.handle_key(key(KeyCode::Char('d')), &state) {
+            Some(Action::LookUpManga { id, .. }) => assert_eq!(id, "m1"),
+            other => panic!("expected the new chapter to be queued, got {other:?}"),
+        }
+
+        assert!(screen.handle_key(key(KeyCode::Char('c')), &state).is_none());
+        assert!(render(&mut screen, &state).contains("No chapters of Berserk on disk"));
+        screen.handle_key(key(KeyCode::Enter), &state);
+        assert!(screen.handle_key(key(KeyCode::Enter), &state).is_none());
+        screen.handle_key(key(KeyCode::Tab), &state);
+        assert_eq!(
+            screen.focus,
+            Focus::Manga,
+            "an empty chapter list can be left"
+        );
+
+        // Deleting the last chapters while looking at them goes back to the manga.
+        screen.focus = Focus::Chapters;
+        screen.refresh(&state);
+        assert_eq!(screen.focus, Focus::Manga);
+    }
+
     fn upload(id: &str, number: &str, group: &str) -> Chapter {
         Chapter {
             id: id.to_owned(),
@@ -686,6 +972,7 @@ mod tests {
         let link = MangaLink {
             id: "m1".to_owned(),
             language: "en".to_owned(),
+            newest_chapter: None,
         };
         let found = updates::compare(&screen.manga[0].chapters, slots, link);
         screen.on_checked("Berserk".to_owned(), Ok(Outcome::Found(found)));

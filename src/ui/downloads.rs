@@ -101,6 +101,13 @@ impl DownloadsScreen {
         self.paused = paused;
     }
 
+    /// Whether a chapter is downloading, or queued or paused, into `dir`.
+    pub fn is_saving_into(&self, dir: &std::path::Path) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.is_active() && entry.job.dir == dir)
+    }
+
     /// Whether a chapter is downloading or waiting to, and downloads aren't paused.
     pub fn is_downloading(&self) -> bool {
         !self.paused && self.active_count() > 0

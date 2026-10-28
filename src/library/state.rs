@@ -110,6 +110,18 @@ impl ReadingState {
         progress.read |= finished;
     }
 
+    /// Forgets a chapter's progress, e.g. once it's deleted.
+    pub fn forget_chapter(&mut self, manga: &str, chapter: &str) {
+        if let Some(state) = self.manga.get_mut(manga) {
+            state.chapters.remove(chapter);
+        }
+    }
+
+    /// Forgets everything about a manga, including its direction and strip mode.
+    pub fn forget_manga(&mut self, manga: &str) {
+        self.manga.remove(manga);
+    }
+
     pub fn save(&self) -> io::Result<()> {
         let json = serde_json::to_string_pretty(&self.manga)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -148,6 +160,14 @@ mod tests {
             "a read chapter stays read"
         );
         assert_eq!(state.progress("Berserk", "Ch. 0002.cbz"), None);
+
+        let (mut state, _) = ReadingState::load(state.path().to_owned());
+        state.forget_chapter("Berserk", "Ch. 0001.cbz");
+        assert_eq!(state.progress("Berserk", "Ch. 0001.cbz"), None);
+        assert_eq!(state.direction("Berserk"), Direction::Ltr);
+        state.forget_manga("Berserk");
+        assert_eq!(state.direction("Berserk"), Direction::Rtl);
+        assert_eq!(state.strip("Berserk"), None);
     }
 
     #[test]

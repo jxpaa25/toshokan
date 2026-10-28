@@ -5,6 +5,7 @@
 //! chapters. A `.cbz` or image folder placed directly in the download folder is listed as a
 //! one-chapter entry of its own.
 
+pub mod delete;
 pub mod link;
 pub mod pages;
 pub mod prepare;
@@ -47,6 +48,16 @@ pub struct LibraryManga {
     pub link: Option<MangaLink>,
 }
 
+impl LibraryManga {
+    /// Whether its chapters were deleted to make room while it's still checked for new ones,
+    /// which keeps it in the library with none left.
+    pub fn is_followed(&self) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|link| link.newest_chapter.is_some())
+    }
+}
+
 /// Everything readable in `root`, sorted by title. A missing folder is an empty library.
 pub fn scan(root: &Path) -> io::Result<Vec<LibraryManga>> {
     let entries = match sorted_entries(root) {
@@ -59,7 +70,7 @@ pub fn scan(root: &Path) -> io::Result<Vec<LibraryManga>> {
         // A folder holding chapters is a manga, even if it also has loose images like a cover.
         if path.is_dir() {
             let manga = scan_manga(&path)?;
-            if !manga.chapters.is_empty() {
+            if !manga.chapters.is_empty() || manga.is_followed() {
                 library.push(manga);
                 continue;
             }
@@ -135,7 +146,7 @@ pub(crate) fn chapter_number(name: &str) -> Option<f64> {
 
 /// A `.cbz` file or a folder with images directly inside, unless it's hidden or a
 /// download in progress.
-fn as_chapter(path: &Path) -> Option<LocalChapter> {
+pub(crate) fn as_chapter(path: &Path) -> Option<LocalChapter> {
     let file_name = file_name(path);
     if file_name.starts_with('.') || file_name.ends_with(".part") {
         return None;
@@ -181,7 +192,7 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
         .is_some_and(|ext| extensions.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -260,10 +271,28 @@ mod tests {
         touch(&root.join("Akira 01.cbz"));
         touch(&root.join("Oneshot scans/page1.png"));
         touch(&root.join("Empty manga/notes.txt"));
+        // Linked by a first download that was cancelled: nothing to follow yet.
+        let linked = MangaLink {
+            id: "m1".to_owned(),
+            language: "en".to_owned(),
+            newest_chapter: None,
+        };
+        linked.save(&root.join("Empty manga")).unwrap();
+        let followed = MangaLink {
+            id: "m2".to_owned(),
+            language: "en".to_owned(),
+            newest_chapter: Some("Ch. 0040".to_owned()),
+        };
+        fs::create_dir(root.join("Read and deleted")).unwrap();
+        followed.save(&root.join("Read and deleted")).unwrap();
 
         let library = scan(root).unwrap();
         let titles: Vec<_> = library.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, ["Akira 01", "Berserk", "Oneshot scans"]);
+        assert_eq!(
+            titles,
+            ["Akira 01", "Berserk", "Oneshot scans", "Read and deleted"]
+        );
+        assert!(library[3].chapters.is_empty());
 
         let berserk = &library[1];
         let chapters: Vec<_> = berserk

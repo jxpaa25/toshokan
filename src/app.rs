@@ -18,16 +18,18 @@ use tokio::time::MissedTickBehavior;
 use crate::api::{Chapter, ChapterSlot, Client, Manga, Quality, SearchPage};
 use crate::config::Config;
 use crate::download::{self, Downloader, Job, OutputFormat, SavedQueue};
+use crate::library::delete::{self, Deletion};
 use crate::library::state::{Direction, ReadingState};
 use crate::library::updates::{self, CheckEvent, Outcome};
 use crate::library::{self, LibraryManga};
-use crate::ui::display_path;
+use crate::ui::delete_dialog::DeleteDialog;
 use crate::ui::download_dialog::DownloadDialog;
 use crate::ui::downloads::DownloadsScreen;
 use crate::ui::library::LibraryScreen;
 use crate::ui::manga::MangaScreen;
 use crate::ui::reader::{Fit, Graphics, PageLayout, ReaderResult, ReaderScreen};
 use crate::ui::search::{SearchRequest, SearchScreen};
+use crate::ui::{display_path, format_size};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Turns on reports of mouse buttons and the wheel (not movement), in SGR encoding. Only while
@@ -62,6 +64,13 @@ pub enum Action {
     /// Stop these chapters downloading and delete the pages they saved.
     CancelDownloads(Vec<Job>),
     PauseDownloads(bool),
+    /// Ask before deleting these from the library.
+    ConfirmDelete(Deletion),
+    Delete {
+        deletion: Deletion,
+        /// The space it frees, to say so afterwards.
+        size: u64,
+    },
     /// Check the library for chapters released on MangaDex since they were downloaded.
     CheckForNew,
     /// Fetch a library manga's details from MangaDex, then do `then` with them.
@@ -136,6 +145,17 @@ pub enum Message {
         result: Result<Manga, String>,
         then: LookUp,
     },
+    Deleted {
+        deletion: Deletion,
+        size: u64,
+        result: Result<(), String>,
+    },
+}
+
+/// A popup over the current screen, which gets the keys while it's open.
+enum Dialog {
+    Download(DownloadDialog),
+    Delete(DeleteDialog),
 }
 
 /// A full-screen view shown over search and the manga screen, which keep their state.
@@ -165,7 +185,7 @@ pub struct App {
     downloads: DownloadsScreen,
     library: LibraryScreen,
     overlay: Overlay,
-    dialog: Option<DownloadDialog>,
+    dialog: Option<Dialog>,
     /// Drawn over everything else while open.
     reader: Option<ReaderScreen>,
     /// Layout and fit of the last closed reader, so the next one opens the same way.
@@ -285,8 +305,10 @@ impl App {
                     .render(frame, area, &self.config.settings, spinner),
             },
         }
-        if let Some(dialog) = &self.dialog {
-            dialog.render(frame, area);
+        match &self.dialog {
+            Some(Dialog::Download(dialog)) => dialog.render(frame, area),
+            Some(Dialog::Delete(dialog)) => dialog.render(frame, area),
+            None => {}
         }
     }
 
@@ -353,7 +375,10 @@ impl App {
         let action = if let Some(reader) = &mut self.reader {
             reader.handle_key(key)
         } else if let Some(dialog) = &mut self.dialog {
-            dialog.handle_key(key)
+            match dialog {
+                Dialog::Download(dialog) => dialog.handle_key(key),
+                Dialog::Delete(dialog) => dialog.handle_key(key),
+            }
         } else if key.code == KeyCode::F(1) {
             self.toggle_overlay(Overlay::Library);
             None
@@ -414,6 +439,11 @@ impl App {
                 }
             }
             Message::Manga { result, then } => self.on_looked_up(result, then),
+            Message::Deleted {
+                deletion,
+                size,
+                result,
+            } => self.on_deleted(&deletion, size, result),
         }
     }
 
@@ -489,6 +519,49 @@ impl App {
                 self.manga_from_library = Some(dir);
             }
         }
+    }
+
+    /// Forgets what went, even when something else couldn't be deleted, and shows the
+    /// library without it.
+    fn on_deleted(&mut self, deletion: &Deletion, size: u64, result: Result<(), String>) {
+        let manga = deletion.manga();
+        for chapter in deletion.chapters() {
+            if !chapter.path.exists() {
+                self.reading.forget_chapter(&manga.key, &chapter.file_name);
+            }
+        }
+        let manga_gone = matches!(deletion, Deletion::Manga(_))
+            && manga.chapters.iter().all(|chapter| !chapter.path.exists());
+        if manga_gone {
+            self.reading.forget_manga(&manga.key);
+            self.library.forget(&manga.key);
+            if let Some(dir) = &manga.dir {
+                self.downloader.forget_folder(dir);
+            }
+        }
+        self.save_reading();
+        self.library.refresh(&self.reading);
+        self.refresh_downloaded();
+        let size = format_size(size);
+        let notice = match (result, deletion) {
+            (Err(err), _) => format!("Couldn't delete everything: {err}"),
+            (Ok(()), Deletion::Manga(manga)) => {
+                let mut notice = format!("Deleted {} ({size})", manga.title);
+                if manga.dir.as_ref().is_some_and(|dir| dir.exists()) {
+                    notice.push_str(" · kept its folder, which holds other files");
+                }
+                notice
+            }
+            (Ok(()), Deletion::Chapters { manga, chapters }) => {
+                let count = chapters.len();
+                let plural = if count == 1 { "" } else { "s" };
+                format!(
+                    "Deleted {count} chapter{plural} of {} ({size})",
+                    manga.title
+                )
+            }
+        };
+        self.notify(notice);
     }
 
     fn handle_update(&mut self, update: download::Update) {
@@ -607,6 +680,35 @@ impl App {
                 self.downloader.set_paused(paused);
                 self.save_queue();
             }
+            Action::ConfirmDelete(deletion) => {
+                let manga = deletion.manga();
+                let downloading = matches!(deletion, Deletion::Manga(_))
+                    && manga
+                        .dir
+                        .as_ref()
+                        .is_some_and(|dir| self.downloads.is_saving_into(dir));
+                if downloading {
+                    let title = manga.title.clone();
+                    self.notify(format!(
+                        "Chapters of {title} are downloading; cancel them on F3 first"
+                    ));
+                } else {
+                    self.dialog = Some(Dialog::Delete(DeleteDialog::new(deletion)));
+                }
+            }
+            Action::Delete { deletion, size } => {
+                self.dialog = None;
+                let root = self.downloader.root().to_owned();
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = delete::delete(&root, &deletion).map_err(|err| err.to_string());
+                    let _ = tx.send(Message::Deleted {
+                        deletion,
+                        size,
+                        result,
+                    });
+                });
+            }
             Action::CheckForNew => self.check_for_new(true),
             Action::LookUpManga { id, then } => self.spawn_look_up(id, then),
             Action::ReadDownloaded { manga, chapter } => self.read_downloaded(&manga, &chapter),
@@ -691,7 +793,7 @@ impl App {
             self.config.settings.format,
             &dir,
         );
-        self.dialog = Some(dialog.with_note(note));
+        self.dialog = Some(Dialog::Download(dialog.with_note(note)));
     }
 
     /// Starts checking the library for new chapters in the background, replacing any check

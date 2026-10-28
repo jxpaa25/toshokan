@@ -163,6 +163,7 @@ async fn find_link(
                 return Ok(Some(MangaLink {
                     id,
                     language: chapter_language.unwrap_or_else(|| language.to_owned()),
+                    newest_chapter: None,
                 }));
             }
             // The chapter may have been taken down since; the title may still work.
@@ -179,24 +180,28 @@ async fn find_link(
         (Some(found), None) => Some(MangaLink {
             id: found.id,
             language: language.to_owned(),
+            newest_chapter: None,
         }),
         _ => None,
     })
 }
 
-/// Compares the chapters on MangaDex with the ones on disk.
+/// Compares the chapters on MangaDex with the ones on disk, and the newest one the folder
+/// held if chapters were deleted since.
 pub fn compare(local: &[LocalChapter], slots: Vec<ChapterSlot>, link: MangaLink) -> Found {
-    let mut numbered: Vec<(f64, &LocalChapter)> = local
+    let mut numbered: Vec<(f64, &str)> = local
         .iter()
-        .filter_map(|c| Some((chapter_number(&c.name)?, c)))
+        .map(|c| c.name.as_str())
+        .chain(link.newest_chapter.as_deref())
+        .filter_map(|name| Some((chapter_number(name)?, name)))
         .collect();
     numbered.sort_by(|a, b| b.0.total_cmp(&a.0));
     // The newest chapter whose name tells which groups released it.
-    let groups = numbered.iter().find_map(|(_, chapter)| {
+    let groups = numbered.iter().find_map(|(_, name)| {
         slots
             .iter()
             .flat_map(|slot| &slot.uploads)
-            .find(|upload| download::released_by(&chapter.name, &upload.groups))
+            .find(|upload| download::released_by(name, &upload.groups))
             .map(|upload| upload.groups.clone())
     });
     let chapters = match numbered.first() {
@@ -303,6 +308,7 @@ mod tests {
         MangaLink {
             id: "m1".to_owned(),
             language: "en".to_owned(),
+            newest_chapter: None,
         }
     }
 
@@ -338,6 +344,36 @@ mod tests {
             .map(|c| c.slot.label())
             .collect();
         assert_eq!(missing, ["Ch. 2.5"]);
+    }
+
+    #[test]
+    fn counts_from_the_newest_chapter_even_once_deleted() {
+        let slots = || {
+            vec![
+                slot("1", vec![upload("1a", "1", "A")]),
+                slot("2", vec![upload("2a", "2", "A"), upload("2b", "2", "B")]),
+                slot("3", vec![upload("3a", "3", "A"), upload("3b", "3", "B")]),
+            ]
+        };
+        let link = MangaLink {
+            newest_chapter: Some("Ch. 0002 [B]".to_owned()),
+            ..link()
+        };
+        // Chapter 2 was read and deleted; chapter 1 is still there.
+        let found = compare(&[local("Ch. 0001 [A]")], slots(), link.clone());
+        assert_eq!(found.groups.as_deref(), Some(&["B".to_owned()][..]));
+        let new: Vec<_> = found.chapters.iter().map(|c| c.slot.label()).collect();
+        assert_eq!(new, ["Ch. 3"]);
+        assert_eq!(found.chapters[0].upload().unwrap().id, "3b");
+
+        // Every chapter deleted.
+        let found = compare(&[], slots(), link.clone());
+        assert_eq!(found.chapters.len(), 1);
+
+        // Chapters downloaded since count once they're newer.
+        let found = compare(&[local("Ch. 0003 [A]")], slots(), link);
+        assert!(found.chapters.is_empty());
+        assert_eq!(found.groups.as_deref(), Some(&["A".to_owned()][..]));
     }
 
     #[test]
