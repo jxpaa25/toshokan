@@ -49,6 +49,9 @@ struct MangaState {
     /// Keyed by chapter file name.
     #[serde(default)]
     chapters: BTreeMap<String, Progress>,
+    /// Long-strip mode, once the user picked it; until then it's worked out per chapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strip: Option<bool>,
 }
 
 pub struct ReadingState {
@@ -107,6 +110,14 @@ impl ReadingState {
         self.manga.entry(manga.to_owned()).or_default().direction = direction;
     }
 
+    pub fn strip(&self, manga: &str) -> Option<bool> {
+        self.manga.get(manga)?.strip
+    }
+
+    pub fn set_strip(&mut self, manga: &str, strip: bool) {
+        self.manga.entry(manga.to_owned()).or_default().strip = Some(strip);
+    }
+
     pub fn progress(&self, manga: &str, chapter: &str) -> Option<Progress> {
         self.manga.get(manga)?.chapters.get(chapter).copied()
     }
@@ -144,12 +155,15 @@ mod tests {
         assert_eq!(state.direction("Berserk"), Direction::Rtl);
 
         state.set_direction("Berserk", Direction::Ltr);
+        assert_eq!(state.strip("Berserk"), None);
+        state.set_strip("Berserk", true);
         state.record("Berserk", "Ch. 0001.cbz", 24, true);
         state.record("Berserk", "Ch. 0001.cbz", 3, false);
         state.save().unwrap();
 
         let (state, _) = ReadingState::load(path);
         assert_eq!(state.direction("Berserk"), Direction::Ltr);
+        assert_eq!(state.strip("Berserk"), Some(true));
         assert_eq!(
             state.progress("Berserk", "Ch. 0001.cbz"),
             Some(Progress {

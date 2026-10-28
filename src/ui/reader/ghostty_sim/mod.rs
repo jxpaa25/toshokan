@@ -11,7 +11,7 @@ mod model;
 
 use std::collections::HashMap;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use image::{Rgb, RgbImage};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -29,6 +29,8 @@ use crate::ui::kitty::{MAX_COLUMNS, MAX_ROWS, Medium};
 
 /// The most pages the reader keeps in the terminal: four views of up to two pages.
 const MAX_IMAGES: usize = 8;
+/// A generous bound on the tiles a strip keeps in the terminal.
+const MAX_STRIP_IMAGES: usize = 40;
 
 #[derive(Clone, Copy)]
 struct PageSpec {
@@ -284,7 +286,33 @@ impl Harness {
     fn key(&mut self, code: KeyCode) -> Option<Action> {
         let reader = self.reader.as_mut().expect("reader open");
         let action = reader.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
-        match &action {
+        self.apply(&action);
+        self.frame();
+        action
+    }
+
+    /// One step of the mouse wheel.
+    fn wheel(&mut self, down: bool) -> Option<Action> {
+        let reader = self.reader.as_mut().expect("reader open");
+        let kind = if down {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        };
+        let action = reader.handle_mouse(MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        self.apply(&action);
+        self.frame();
+        action
+    }
+
+    /// Does what the app does with the reader's actions.
+    fn apply(&mut self, action: &Option<Action>) {
+        match action {
             Some(Action::CloseReader) => {
                 let mut reader = self.reader.take().unwrap();
                 self.pending_output.extend(reader.close());
@@ -309,10 +337,9 @@ impl Harness {
                 page,
                 finished,
             }) => self.state.record(manga, chapter, *page, *finished),
+            Some(Action::SetStrip { manga, strip }) => self.state.set_strip(manga, *strip),
             _ => {}
         }
-        self.frame();
-        action
     }
 
     fn press(&mut self, code: KeyCode) {
@@ -369,6 +396,9 @@ impl Harness {
         if r.error.is_some() {
             return;
         }
+        if r.strip.is_some() {
+            return self.check_strip_settled(r);
+        }
         let chapter = r.chapter;
         let mut held: Vec<usize> = self
             .ghostty
@@ -419,7 +449,12 @@ impl Harness {
             problems.push("a chunked transmission is still open after the frame".into());
         }
         self.most_images = self.most_images.max(self.ghostty.images.len());
-        if self.ghostty.images.len() > MAX_IMAGES {
+        let strip = self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.reading.strip.is_some());
+        let limit = if strip { MAX_STRIP_IMAGES } else { MAX_IMAGES };
+        if self.ghostty.images.len() > limit {
             problems.push(format!(
                 "Ghostty holds {} images",
                 self.ghostty.images.len()
@@ -455,6 +490,26 @@ impl Harness {
     fn describe(&self) -> String {
         match &self.reader {
             None => "reader closed".into(),
+            Some(reader) if reader.reading.strip.is_some() => {
+                let r = &reader.reading;
+                let strip = r.strip.as_ref().unwrap();
+                format!(
+                    "chapter {} strip at page {} +{:.3}, scroll {} of {:?} rows, {:?}, popup {}, {} images {:?}",
+                    r.chapter,
+                    strip.page,
+                    strip.offset,
+                    strip.scroll,
+                    strip.layout.as_ref().map(|l| l.total_rows()),
+                    r.fit,
+                    reader.end_prompt,
+                    self.ghostty.images.len(),
+                    self.ghostty
+                        .images
+                        .values()
+                        .map(|i| (i.id, self.book.identify(i), i.width, i.height))
+                        .collect::<Vec<_>>()
+                )
+            }
             Some(reader) => {
                 let r = &reader.reading;
                 format!(
@@ -519,6 +574,10 @@ impl Harness {
         problems: &mut Vec<String>,
     ) -> Vec<PageRect> {
         let r = &reader.reading;
+        if r.strip.is_some() {
+            self.verify_strip(reader, buf, screen, problems);
+            return Vec::new();
+        }
         let chapter = r.chapter;
         let (image_area, status) = split(buf.area);
 
@@ -866,6 +925,386 @@ impl Harness {
                 "{:?}: pages are {width}x{rows} cells in a {}x{} area",
                 r.fit, area.width, area.height
             ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Long strips
+// ---------------------------------------------------------------------------------------------
+
+/// The strip as the reader is meant to lay it out, worked out from the page files' sizes:
+/// pages at their usual width (or the area's), stacked, each cut into images of at most 297
+/// rows and 10000 px.
+struct ExpectedStrip {
+    x: u16,
+    cols: u16,
+    starts: Vec<u32>,
+    per_tile: u32,
+    broken: Vec<bool>,
+}
+
+impl ExpectedStrip {
+    fn new(specs: &[PageSpec], fit: Fit, area: Rect, cell: (u16, u16)) -> Self {
+        let (cw, ch) = (u32::from(cell.0), u32::from(cell.1));
+        let mut widths: Vec<u32> = specs
+            .iter()
+            .filter(|s| !s.broken)
+            .map(|s| s.size.0)
+            .collect();
+        widths.sort();
+        let width = widths.get(widths.len() / 2).copied().unwrap_or(1);
+        let full = u32::from(area.width)
+            .min(u32::from(MAX_COLUMNS))
+            .min(10_000 / cw)
+            .max(1);
+        let cols = match fit {
+            Fit::Width => full,
+            Fit::Page => (width / cw).clamp(1, full),
+        };
+        let mut starts = vec![0];
+        for spec in specs {
+            let rows = if spec.broken {
+                3
+            } else {
+                let height = f64::from(spec.size.1) * f64::from(cols * cw) / f64::from(spec.size.0);
+                ((height / f64::from(ch)).round() as u32).max(1)
+            };
+            starts.push(starts.last().unwrap() + rows);
+        }
+        ExpectedStrip {
+            x: area.x + (area.width - cols as u16) / 2,
+            cols: cols as u16,
+            starts,
+            per_tile: u32::from(MAX_ROWS).min(10_000 / ch),
+            broken: specs.iter().map(|s| s.broken).collect(),
+        }
+    }
+
+    fn total(&self) -> u32 {
+        *self.starts.last().unwrap()
+    }
+
+    fn rows(&self, page: usize) -> u32 {
+        self.starts[page + 1] - self.starts[page]
+    }
+
+    /// The page at strip row `row`, and the row within it.
+    fn page_at(&self, row: u32) -> Option<(usize, u32)> {
+        (0..self.starts.len() - 1)
+            .find(|&p| row < self.starts[p + 1])
+            .map(|p| (p, row - self.starts[p]))
+    }
+
+    /// The pages the reader should keep in the terminal: from a screen above to two below.
+    fn near(&self, scroll: u32, height: u16) -> Vec<usize> {
+        let height = u32::from(height.max(1));
+        let (from, to) = (scroll.saturating_sub(height), scroll + 3 * height);
+        (0..self.starts.len() - 1)
+            .filter(|&p| self.starts[p] < to && self.starts[p + 1] > from && !self.broken[p])
+            .collect()
+    }
+}
+
+/// The end-of-chapter popup: the box between its top-left and bottom-right corners.
+fn popup_box(buf: &Buffer, area: Rect) -> Option<Rect> {
+    let mut top_left = None;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            match buf[(x, y)].symbol() {
+                "┌" if top_left.is_none() => top_left = Some((x, y)),
+                "┘" => {
+                    let (left, top) = top_left?;
+                    return Some(Rect::new(left, top, x + 1 - left, y + 1 - top));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+impl Harness {
+    fn strip_scroll(&self) -> u32 {
+        self.reader().reading.strip.as_ref().unwrap().scroll
+    }
+
+    fn strip_max_scroll(&self) -> u32 {
+        let strip = self.reader().reading.strip.as_ref().unwrap();
+        strip.layout.as_ref().unwrap().max_scroll()
+    }
+
+    fn top_page(&self) -> usize {
+        self.reader().reading.first_page()
+    }
+
+    fn check_strip_settled(&self, r: &super::Reading) {
+        let strip = r.strip.as_ref().unwrap();
+        assert!(
+            strip.layout.is_some(),
+            "settled without measuring the pages"
+        );
+        let size = self.terminal.size().unwrap();
+        let (area, _) = split(Rect::new(0, 0, size.width, size.height));
+        let expected = ExpectedStrip::new(&self.book.specs[r.chapter], r.fit, area, self.cell);
+        let mut tiles: HashMap<usize, u32> = HashMap::new();
+        for image in self.ghostty.images.values() {
+            if let Some((_, page)) = self.book.identify(image) {
+                *tiles.entry(page).or_default() += 1;
+            }
+        }
+        let mut held: Vec<usize> = tiles.keys().copied().collect();
+        held.sort();
+        let near = expected.near(strip.scroll, area.height);
+        assert_eq!(
+            held, near,
+            "after settling the terminal should hold exactly the pages near scroll {}",
+            strip.scroll
+        );
+        for page in near {
+            let want = expected.rows(page).div_ceil(expected.per_tile);
+            assert_eq!(tiles[&page], want, "page {page} should be in {want} images");
+        }
+        assert_eq!(self.files_waiting(), 0, "page files left behind");
+        let text = crate::ui::buffer_text(&self.terminal);
+        assert!(
+            !text.contains("Loading page…"),
+            "still loading after settling"
+        );
+    }
+
+    fn verify_strip(
+        &self,
+        reader: &ReaderScreen,
+        buf: &Buffer,
+        screen: &Screen,
+        problems: &mut Vec<String>,
+    ) {
+        let r = &reader.reading;
+        let strip = r.strip.as_ref().unwrap();
+        let chapter = r.chapter;
+        let (area, status) = split(buf.area);
+        let text = crate::ui::buffer_text(&self.terminal);
+        let lines: Vec<&str> = text.lines().collect();
+        for x in 0..status.width {
+            if buf[(status.x + x, status.y)]
+                .symbol()
+                .starts_with(PLACEHOLDER)
+                || screen.at(status.x + x, status.y).is_some()
+            {
+                problems.push(format!("status line cell {x} shows an image"));
+            }
+        }
+
+        // Every image is a tile of a page of this chapter, with one virtual placement.
+        let mut tile_rows: HashMap<u32, u32> = HashMap::new();
+        for image in self.ghostty.images.values() {
+            match self.book.identify(image) {
+                Some((c, _)) if c == chapter => {}
+                other => problems.push(format!(
+                    "image {} shows {other:?}, not a page of chapter {chapter}",
+                    image.id
+                )),
+            }
+            let placements: Vec<_> = self
+                .ghostty
+                .placements
+                .iter()
+                .filter(|(k, _)| k.image_id == image.id)
+                .collect();
+            if placements.len() == 1
+                && placements[0].1.location == Location::Virtual
+                && placements[0].0.external
+                && placements[0].0.id == 1
+            {
+                tile_rows.insert(image.id, placements[0].1.rows);
+            } else {
+                problems.push(format!(
+                    "image {} should have one virtual placement p=1, has {placements:?}",
+                    image.id
+                ));
+            }
+        }
+        if area.is_empty() {
+            return;
+        }
+        let Some(layout) = &strip.layout else {
+            if !screen.placeholder_cells.is_empty() {
+                problems.push("placeholders drawn before the pages are measured".into());
+            }
+            if !text.contains("Loading page…") {
+                problems.push("nothing says the strip is loading".into());
+            }
+            return;
+        };
+        let expected = ExpectedStrip::new(&self.book.specs[chapter], r.fit, area, self.cell);
+        if (layout.x, layout.cols, layout.total_rows())
+            != (expected.x, expected.cols, expected.total())
+        {
+            problems.push(format!(
+                "strip at x {} with {} columns and {} rows instead of x {} with {} and {}",
+                layout.x,
+                layout.cols,
+                layout.total_rows(),
+                expected.x,
+                expected.cols,
+                expected.total()
+            ));
+            return;
+        }
+        let scroll = strip.scroll;
+        let max_scroll = expected.total().saturating_sub(u32::from(area.height));
+        if scroll > max_scroll {
+            problems.push(format!(
+                "scrolled to {scroll}, past the end at {max_scroll}"
+            ));
+        }
+        let popup = popup_box(buf, area);
+        if reader.end_prompt != popup.is_some() {
+            problems.push(format!(
+                "popup shown: {}, popup box on screen: {popup:?}",
+                reader.end_prompt
+            ));
+        }
+        let in_popup = |x: u16, y: u16| popup.is_some_and(|p| p.contains((x, y).into()));
+        let row_of = |y: u16| scroll + u32::from(y - area.y);
+
+        // Pages that show anything; every other page on screen says why it doesn't.
+        let mut shown_pages = std::collections::HashSet::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = screen.at(x, y)
+                    && let Some((_, page)) = self
+                        .ghostty
+                        .images
+                        .get(&cell.image_id)
+                        .and_then(|i| self.book.identify(i))
+                {
+                    shown_pages.insert(page);
+                }
+            }
+        }
+        let bottom = (scroll + u32::from(area.height)).min(expected.total());
+        let mut row = scroll;
+        while row < bottom {
+            let (page, within) = expected.page_at(row).unwrap();
+            let rows = (expected.rows(page) - within).min(bottom - row);
+            let y = area.y + (row - scroll) as u16 + (rows / 2) as u16;
+            let line = lines[usize::from(y)];
+            let hidden = popup.is_some_and(|p| y >= p.top() && y < p.bottom());
+            // The message needs room to be read.
+            let room = expected.cols >= 14;
+            if !shown_pages.contains(&page)
+                && !hidden
+                && room
+                && !line.contains("Loading page…")
+                && !line.contains(&format!("Couldn't show page {}", page + 1))
+            {
+                problems.push(format!(
+                    "page {page} is on screen but shows neither the page nor a message"
+                ));
+            }
+            row += rows;
+        }
+
+        let mut reported = 0;
+        let mut report = |problems: &mut Vec<String>, message: String| {
+            reported += 1;
+            if reported <= 12 {
+                problems.push(message);
+            }
+        };
+        let cols = f64::from(expected.cols);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let shown = screen.at(x, y);
+                let placeholder = buf[(x, y)].symbol().starts_with(PLACEHOLDER);
+                if in_popup(x, y) {
+                    if shown.is_some() || placeholder {
+                        report(problems, format!("popup cell ({x},{y}) shows an image"));
+                    }
+                    continue;
+                }
+                let col = x.checked_sub(expected.x).filter(|&col| col < expected.cols);
+                let (Some(col), Some((page, within))) = (col, expected.page_at(row_of(y))) else {
+                    if shown.is_some() || placeholder {
+                        report(
+                            problems,
+                            format!("({x},{y}) is outside the strip but shows an image"),
+                        );
+                    }
+                    continue;
+                };
+                self.cells_checked.set(self.cells_checked.get() + 1);
+                let Some(cell) = shown else {
+                    if shown_pages.contains(&page) {
+                        report(problems, format!("({x},{y}) of page {page} shows nothing"));
+                    }
+                    continue;
+                };
+                let image = &self.ghostty.images[&cell.image_id];
+                if self.book.identify(image) != Some((chapter, page)) {
+                    report(
+                        problems,
+                        format!(
+                            "({x},{y}) should show page {page} but shows {:?}",
+                            self.book.identify(image)
+                        ),
+                    );
+                    continue;
+                }
+                // Which row of the page this is: the row within the tile, from where the cell
+                // samples the image, plus where the tile starts, told apart by colour.
+                let page_rows = f64::from(expected.rows(page));
+                let (cx, cy) = cell.centre();
+                let rows_in_tile = f64::from(tile_rows.get(&cell.image_id).copied().unwrap_or(1));
+                let tile_row = cy / f64::from(image.height) * rows_in_tile;
+                let [_, pg, pb] = image.pixel(cx, cy);
+                let coarse = f64::from(pb) / 255.0 * page_rows;
+                let per_tile = f64::from(expected.per_tile);
+                let tile = ((coarse - tile_row) / per_tile).round().max(0.0);
+                let page_row = tile * per_tile + tile_row;
+                let want_row = f64::from(within) + 0.5;
+                let want_u = (f64::from(col) + 0.5) / cols;
+                let u = cx / f64::from(image.width);
+                if (page_row - want_row).abs() > 0.75 || (u - want_u).abs() > 0.75 / cols {
+                    report(
+                        problems,
+                        format!(
+                            "({x},{y}) shows row {page_row:.2}, x {u:.3} of page {page} instead of row {want_row}, x {want_u:.3}"
+                        ),
+                    );
+                    continue;
+                }
+                let v = want_row / page_rows;
+                if (f64::from(pg) / 255.0 - want_u).abs() > 0.03 + 1.0 / f64::from(image.width)
+                    || (f64::from(pb) / 255.0 - v).abs() > 0.03 + 1.0 / page_rows
+                {
+                    report(
+                        problems,
+                        format!(
+                            "({x},{y}): pixel {:?} isn't page {page} at ({want_u:.3},{v:.3})",
+                            [pg, pb]
+                        ),
+                    );
+                }
+                // Pages and tiles meet without a gap; a page that's scaled up may leave a
+                // sliver at the strip's sides.
+                let edge = col == 0 || col + 1 == expected.cols;
+                let needed = if edge { 0.8 } else { 0.999 };
+                if cell.coverage < needed {
+                    report(
+                        problems,
+                        format!(
+                            "({x},{y}) of page {page} is only {:.1}% covered",
+                            cell.coverage * 100.0
+                        ),
+                    );
+                }
+            }
+        }
+        if reported > 12 {
+            problems.push(format!("... {reported} cell problems in all"));
         }
     }
 }
@@ -1374,4 +1813,271 @@ fn reading_back_and_forth_stays_bounded() {
     h.press(KeyCode::Esc);
     assert_eq!(h.ghostty.total_bytes, 0);
     assert_eq!(h.files_waiting(), 0);
+}
+
+/// Webtoon pages: much taller than wide, two a little narrower than the rest and of awkward
+/// sizes, so scaling them to the strip doesn't come out even.
+fn strip_chapter() -> Vec<PageSpec> {
+    vec![
+        page(400, 1600),
+        page(400, 1200),
+        page(400, 2400),
+        page(400, 900),
+        page(383, 1517),
+        page(397, 1601),
+        page(400, 2000),
+    ]
+}
+
+#[test]
+fn long_strips_scroll_continuously_through_the_chapter() {
+    let mut h = Harness::new(&[strip_chapter(), strip_chapter()], Via::Direct, (100, 30));
+    assert!(
+        h.reader().reading.strip.is_some(),
+        "detected as a long strip"
+    );
+    h.settle();
+    // A few rows at a time, across every page boundary, to the bottom.
+    let mut last = 0;
+    loop {
+        h.press(KeyCode::Char('j'));
+        let scroll = h.strip_scroll();
+        if scroll == last {
+            break;
+        }
+        assert_eq!(scroll, (last + 3).min(h.strip_max_scroll()));
+        last = scroll;
+    }
+    assert_eq!(last, h.strip_max_scroll());
+    assert!(
+        h.reader().end_prompt,
+        "going on past the end offers the next chapter"
+    );
+    assert_eq!(
+        h.state
+            .progress("Sim", "Chapter 1")
+            .map(|p| (p.page, p.read)),
+        Some((6, true))
+    );
+    h.press(KeyCode::Esc);
+    // Back up a screen at a time, then jump around.
+    h.press(KeyCode::PageUp);
+    assert_eq!(
+        h.strip_scroll(),
+        last - 27,
+        "a screen less two rows of overlap"
+    );
+    h.press(KeyCode::Home);
+    assert_eq!((h.strip_scroll(), h.top_page()), (0, 0));
+    h.press(KeyCode::Char(' '));
+    h.press(KeyCode::Right);
+    assert_eq!(h.strip_scroll(), 54);
+    h.press(KeyCode::End);
+    assert_eq!(h.strip_scroll(), h.strip_max_scroll());
+    h.press(KeyCode::Char('s'));
+    assert!(h.reader().notice.is_some(), "no spreads in a strip");
+    h.press(KeyCode::Down);
+    assert!(h.reader().end_prompt);
+    match h.key(KeyCode::Enter) {
+        Some(Action::OpenReader { chapter: 1, .. }) => {}
+        other => panic!("expected the next chapter, got {other:?}"),
+    }
+    h.settle();
+    assert!(h.reader().reading.strip.is_some());
+    assert_eq!(h.strip_scroll(), 0);
+    assert!(matches!(h.key(KeyCode::Esc), Some(Action::CloseReader)));
+    assert!(h.ghostty.images.is_empty() && h.ghostty.placements.is_empty());
+    assert!(h.cells_checked.get() > 100_000, "{}", h.cells_checked.get());
+}
+
+#[test]
+fn tall_strip_pages_are_cut_into_tiles() {
+    let chapter = vec![page(403, 16001), page(400, 1600), page(400, 1600)];
+    let mut h = Harness::new(&[chapter], Via::TempFile, (100, 30));
+    h.settle();
+    let per_tile = u32::from(MAX_ROWS).min(10_000 / u32::from(h.cell.1));
+    let rows = h
+        .reader()
+        .reading
+        .strip
+        .as_ref()
+        .unwrap()
+        .layout
+        .as_ref()
+        .unwrap()
+        .rows(0);
+    assert!(
+        rows > per_tile,
+        "the first page needs more than one image: {rows} rows"
+    );
+    // Every tile boundary passes the screen, a screen and then a row at a time, at the
+    // pages' width and scaled up to the full width.
+    for _ in 0..2 {
+        while h.strip_scroll() < h.strip_max_scroll() {
+            h.press(KeyCode::Char(' '));
+            h.press(KeyCode::Char('j'));
+        }
+        h.press(KeyCode::Home);
+        h.press(KeyCode::Char('f'));
+    }
+    h.press(KeyCode::Esc);
+    assert_eq!(h.files_waiting(), 0);
+}
+
+#[test]
+fn strips_keep_their_place_when_the_width_changes() {
+    let mut h = Harness::new(&[strip_chapter()], Via::TempFile, (120, 40));
+    h.settle();
+    for _ in 0..5 {
+        h.press(KeyCode::Char(' '));
+    }
+    let page = h.top_page();
+    let offset = h.reader().reading.strip.as_ref().unwrap().offset;
+    // Full width scales the pages up on the GPU; seams may only show at the sides.
+    h.press(KeyCode::Char('f'));
+    assert_eq!(
+        h.reader()
+            .reading
+            .strip
+            .as_ref()
+            .unwrap()
+            .layout
+            .as_ref()
+            .unwrap()
+            .cols,
+        120
+    );
+    assert_eq!(h.top_page(), page);
+    for (width, height) in [(80, 30), (200, 50), (30, 12), (1, 5), (160, 45)] {
+        h.resize(width, height);
+        let strip = h.reader().reading.strip.as_ref().unwrap();
+        if h.strip_scroll() < h.strip_max_scroll() {
+            assert_eq!(strip.page, page, "same page at {width}x{height}");
+            assert!((strip.offset - offset).abs() < 0.05);
+        }
+    }
+    h.press(KeyCode::Char('j'));
+    h.press(KeyCode::Char('f'));
+    h.resize(100, 30);
+    h.press(KeyCode::Esc);
+    assert_eq!(h.files_waiting(), 0);
+}
+
+#[test]
+fn switching_between_strip_and_pages() {
+    let mut h = Harness::new(&[strip_chapter()], Via::Direct, (120, 40));
+    h.settle();
+    while h.top_page() < 2 {
+        h.press(KeyCode::Char(' '));
+    }
+    let page = h.top_page();
+    assert!(matches!(
+        h.key(KeyCode::Char('w')),
+        Some(Action::SetStrip { strip: false, .. })
+    ));
+    h.settle();
+    assert_eq!(h.view_pages(), [page], "the same page, on its own");
+    assert_eq!(h.state.strip("Sim"), Some(false));
+    h.press(KeyCode::Right);
+    h.press(KeyCode::Char('s'));
+    let spread = h.view_pages();
+    h.key(KeyCode::Char('w'));
+    h.settle();
+    assert_eq!(h.top_page(), spread[0]);
+    // The choice sticks for the manga, over what the pages look like.
+    h.key(KeyCode::Char('w'));
+    h.press(KeyCode::Esc);
+    let (reader, _) = ReaderScreen::new(
+        h.book.manga.clone(),
+        0,
+        &h.state,
+        &h.graphics,
+        PageLayout::Single,
+        Fit::Page,
+    );
+    assert!(reader.reading.strip.is_none());
+}
+
+#[test]
+fn the_wheel_scrolls_strips_and_turns_pages() {
+    let mut h = Harness::new(&[strip_chapter()], Via::Direct, (100, 30));
+    h.settle();
+    for _ in 0..5 {
+        h.wheel(true);
+    }
+    h.settle();
+    assert_eq!(h.strip_scroll(), 15);
+    h.wheel(false);
+    h.settle();
+    assert_eq!(h.strip_scroll(), 12);
+    h.key(KeyCode::Char('w'));
+    h.settle();
+    let page = h.view_pages()[0];
+    h.wheel(true);
+    h.wheel(true);
+    h.settle();
+    assert_eq!(h.view_pages(), [page + 1], "one flick turns one page");
+}
+
+#[test]
+fn a_broken_strip_page_says_so_and_the_rest_still_show() {
+    let chapter = vec![
+        page(400, 1600),
+        broken(),
+        page(400, 1600),
+        page(400, 1600),
+        page(400, 1600),
+    ];
+    let mut h = Harness::new(&[chapter], Via::Direct, (100, 30));
+    assert!(h.reader().reading.strip.is_some());
+    h.settle();
+    // The broken page takes a few rows after the first page's 80.
+    for _ in 0..20 {
+        h.press(KeyCode::Char('j'));
+    }
+    assert!(crate::ui::buffer_text(&h.terminal).contains("Couldn't show page 2"));
+    h.press(KeyCode::End);
+}
+
+#[test]
+fn strip_results_arriving_after_the_reader_moved_on() {
+    for via in [Via::Direct, Via::TempFile] {
+        let mut h = Harness::new(&[strip_chapter(), strip_chapter()], via, (100, 30));
+        // Measuring and the first pages are still out when the reader starts moving.
+        h.finish_job();
+        for _ in 0..6 {
+            h.key(KeyCode::Char(' '));
+        }
+        h.finish_job();
+        h.key(KeyCode::Char('f'));
+        h.finish_job();
+        h.key(KeyCode::Char('w'));
+        h.finish_job();
+        h.key(KeyCode::Char('w'));
+        h.resize(140, 40);
+        h.key(KeyCode::End);
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Enter);
+        h.finish_job();
+        h.key(KeyCode::End);
+        assert!(!h.jobs.is_empty());
+        h.key(KeyCode::Esc);
+        while !h.jobs.is_empty() {
+            h.finish_job();
+        }
+        assert!(h.ghostty.images.is_empty());
+        assert_eq!(h.files_waiting(), 0);
+    }
+}
+
+#[test]
+fn full_width_strips_meet_without_gaps() {
+    let mut h = Harness::new(&[strip_chapter()], Via::Direct, (100, 30));
+    h.settle();
+    h.press(KeyCode::Char('f'));
+    // Every page boundary passes the screen with the pages scaled up on the GPU.
+    while h.strip_scroll() < h.strip_max_scroll() {
+        h.press(KeyCode::Char(' '));
+        h.press(KeyCode::Char('j'));
+    }
 }

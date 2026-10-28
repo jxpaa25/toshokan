@@ -54,6 +54,26 @@ pub fn shrink_to(image: DynamicImage, bounds: Bounds) -> PreparedPage {
     }
 }
 
+/// Scales `image` to fill `size` pixels exactly (a strip page's cells), so neighbouring pages
+/// meet without a gap. When that would make it wider, it keeps its width and takes the cells'
+/// shape, rounded to be a little taller rather than shorter: the terminal then fits the
+/// height exactly and leaves any sliver at the sides, not between pages.
+pub fn fill_cells(image: DynamicImage, size: (u32, u32)) -> PreparedPage {
+    let native = (image.width(), image.height());
+    let (width, height) = if native.0 >= size.0 {
+        size
+    } else {
+        let height = f64::from(native.0) * f64::from(size.1) / f64::from(size.0.max(1));
+        (native.0, (height.ceil() as u32).max(1))
+    };
+    PreparedPage {
+        native,
+        width,
+        height,
+        rgb: resize_rgb(image.into_rgb8(), (width, height)).into_raw(),
+    }
+}
+
 /// Resizes to exactly `size` with the fast SIMD resizer; returns `image` as is when it's
 /// already that size.
 pub fn resize_rgb(image: RgbImage, size: (u32, u32)) -> RgbImage {
@@ -100,6 +120,18 @@ mod tests {
         assert_eq!(fitted_size((848, 1216), bounds(424, None)), (424, 608));
         assert_eq!(fitted_size((1, 1), bounds(0, Some(0))), (1, 1));
         assert_eq!(fitted_size((800, 16000), bounds(800, None)), (500, 10000));
+    }
+
+    #[test]
+    fn fills_strip_cells_without_widening() {
+        let page = fill_cells(DynamicImage::new_rgb8(800, 2010), (400, 1000));
+        assert_eq!((page.width, page.height), (400, 1000), "exactly the cells");
+        let narrow = fill_cells(DynamicImage::new_rgb8(300, 760), (600, 1500));
+        assert_eq!(
+            (narrow.width, narrow.height),
+            (300, 750),
+            "the cells' shape, own width"
+        );
     }
 
     #[test]

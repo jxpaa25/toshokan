@@ -1,7 +1,7 @@
 //! Listing and decoding the page images of a downloaded chapter.
 
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
 
 use image::{DynamicImage, ImageReader};
@@ -59,6 +59,56 @@ pub fn load(chapter: &LocalChapter, page: &str) -> Result<DynamicImage, String> 
     image.map_err(|err| format!("couldn't decode {page}: {err}"))
 }
 
+/// How much of a page to read for its size; headers are almost always at the start.
+const HEADER_BYTES: u64 = 64 * 1024;
+
+/// The pixel sizes of `pages` of `chapter`, read from their headers without decoding them.
+/// `None` for a page that can't be read.
+pub fn measure(chapter: &LocalChapter, pages: &[String]) -> Vec<Option<(u32, u32)>> {
+    match chapter.kind {
+        ChapterKind::Cbz => {
+            let Ok(mut archive) = open_archive(&chapter.path) else {
+                return vec![None; pages.len()];
+            };
+            pages
+                .iter()
+                .map(|page| {
+                    let mut entry = archive.by_name(page).ok()?;
+                    let mut bytes = Vec::new();
+                    (&mut entry)
+                        .take(HEADER_BYTES)
+                        .read_to_end(&mut bytes)
+                        .ok()?;
+                    if let Some(size) = size_from(&bytes) {
+                        return Some(size);
+                    }
+                    // The header is further in, e.g. after a big colour profile.
+                    entry.read_to_end(&mut bytes).ok()?;
+                    size_from(&bytes)
+                })
+                .collect()
+        }
+        ChapterKind::Folder => pages
+            .iter()
+            .map(|page| {
+                ImageReader::open(chapter.path.join(page))
+                    .and_then(|reader| reader.with_guessed_format())
+                    .ok()?
+                    .into_dimensions()
+                    .ok()
+            })
+            .collect(),
+    }
+}
+
+fn size_from(bytes: &[u8]) -> Option<(u32, u32)> {
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 fn open_archive(path: &Path) -> Result<ZipArchive<BufReader<File>>, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     ZipArchive::new(BufReader::new(file)).map_err(|err| format!("not a readable CBZ: {err}"))
@@ -108,6 +158,8 @@ mod tests {
 
         let chapter = chapter(&path, ChapterKind::Cbz);
         assert_eq!(list(&chapter).unwrap(), ["1.png", "2.png", "10.png"]);
+        let names = ["1.png".to_owned(), "nope".to_owned()];
+        assert_eq!(measure(&chapter, &names), [Some((4, 6)), None]);
         let page = load(&chapter, "10.png").unwrap();
         assert_eq!((page.width(), page.height()), (4, 6));
     }
@@ -121,6 +173,7 @@ mod tests {
 
         let chapter = chapter(dir.path(), ChapterKind::Folder);
         assert_eq!(list(&chapter).unwrap(), ["001.png", "002.png"]);
+        assert_eq!(measure(&chapter, &["002.png".to_owned()]), [Some((3, 5))]);
         assert_eq!(load(&chapter, "002.png").unwrap().height(), 5);
 
         let empty = tempfile::tempdir().unwrap();

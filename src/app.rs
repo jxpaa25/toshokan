@@ -30,6 +30,10 @@ use crate::ui::reader::{Fit, Graphics, PageLayout, ReaderResult, ReaderScreen};
 use crate::ui::search::{SearchRequest, SearchScreen};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Turns on reports of mouse buttons and the wheel (not movement), in SGR encoding. Only while
+/// the reader is open, so the rest of the app keeps the terminal's own text selection.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 
 /// Something a screen wants the app to do.
 #[derive(Debug)]
@@ -80,6 +84,11 @@ pub enum Action {
     SetDirection {
         manga: String,
         direction: Direction,
+    },
+    /// Remember whether this manga is read as a long strip.
+    SetStrip {
+        manga: String,
+        strip: bool,
     },
     CloseReader,
     CloseDialog,
@@ -246,9 +255,10 @@ pub async fn run(
             _ = ticker.tick(), if app.is_busy() => app.tick = app.tick.wrapping_add(1),
         }
     }
-    // Free the reader's images in the terminal before leaving.
+    // Free the reader's images in the terminal and give the mouse back before leaving.
     if let Some(mut reader) = app.reader.take() {
         app.terminal_output.extend(reader.close());
+        app.terminal_output.extend(MOUSE_OFF);
     }
     app.write_terminal_output(terminal)
 }
@@ -315,8 +325,19 @@ impl App {
     }
 
     fn handle_event(&mut self, event: Event) {
-        let Event::Key(key) = event else {
-            return;
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Mouse(mouse) => {
+                let action = self
+                    .reader
+                    .as_mut()
+                    .and_then(|reader| reader.handle_mouse(mouse));
+                if let Some(action) = action {
+                    self.perform(action);
+                }
+                return;
+            }
+            _ => return,
         };
         if key.kind == KeyEventKind::Release {
             return;
@@ -577,8 +598,9 @@ impl App {
                 let (screen, action) =
                     ReaderScreen::new(manga, chapter, &self.reading, &self.graphics, layout, fit);
                 // Opening the next chapter replaces the reader; free the old one's images.
-                if let Some(mut old) = self.reader.replace(screen) {
-                    self.terminal_output.extend(old.close());
+                match self.reader.replace(screen) {
+                    Some(mut old) => self.terminal_output.extend(old.close()),
+                    None => self.terminal_output.extend(MOUSE_ON),
                 }
                 if let Some(action) = action {
                     self.perform(action);
@@ -597,9 +619,14 @@ impl App {
                 self.reading.set_direction(&manga, direction);
                 self.save_reading();
             }
+            Action::SetStrip { manga, strip } => {
+                self.reading.set_strip(&manga, strip);
+                self.save_reading();
+            }
             Action::CloseReader => {
                 if let Some(mut reader) = self.reader.take() {
                     self.terminal_output.extend(reader.close());
+                    self.terminal_output.extend(MOUSE_OFF);
                     self.reader_preferences = reader.preferences();
                     let (manga, chapter) = reader.position();
                     self.library.show_chapter(manga, chapter);

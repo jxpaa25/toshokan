@@ -43,15 +43,42 @@ struct PreparedPage {
     payload: Payload,
 }
 
-enum Payload {
+/// An image's pixels on their way to the terminal.
+pub(super) enum Payload {
     File(TempFile),
     Rgb(Vec<u8>),
+}
+
+impl Payload {
+    /// Writes the pixels to `file` for the terminal to read; without a file, or when writing
+    /// fails (e.g. /dev/shm is full), they're sent inline.
+    pub(super) fn new(file: Option<PathBuf>, rgb: Vec<u8>) -> Self {
+        let Some(path) = file else {
+            return Payload::Rgb(rgb);
+        };
+        let file = TempFile(Some(path));
+        match fs::write(file.path(), &rgb) {
+            Ok(()) => Payload::File(file),
+            Err(_) => Payload::Rgb(rgb),
+        }
+    }
+
+    /// Sends the image as `id` and creates its `placed` placement.
+    pub(super) fn transmit(self, out: &mut Vec<u8>, id: u32, size: (u32, u32), placed: (u16, u16)) {
+        match self {
+            Payload::File(file) => {
+                kitty::transmit_file(out, id, size, file.path(), placed);
+                file.hand_over();
+            }
+            Payload::Rgb(rgb) => kitty::transmit_direct(out, id, size, &rgb, placed),
+        }
+    }
 }
 
 /// A page file waiting for the terminal. It's removed when dropped (the reader moved on, the
 /// app quit, the result never arrived) unless it was handed to the terminal, which deletes it
 /// after reading.
-struct TempFile(Option<PathBuf>);
+pub(super) struct TempFile(Option<PathBuf>);
 
 impl TempFile {
     fn path(&self) -> &std::path::Path {
@@ -73,23 +100,10 @@ impl Drop for TempFile {
 
 impl PrepareJob {
     pub fn run(self) -> Prepared {
-        let result = prepare(&self.chapter, &self.name, self.bounds).map(|page| {
-            let payload = match self.file {
-                Some(path) => {
-                    let file = TempFile(Some(path));
-                    match fs::write(file.path(), &page.rgb) {
-                        Ok(()) => Payload::File(file),
-                        // E.g. /dev/shm is full: send this page inline instead.
-                        Err(_) => Payload::Rgb(page.rgb),
-                    }
-                }
-                None => Payload::Rgb(page.rgb),
-            };
-            PreparedPage {
-                native: page.native,
-                size: (page.width, page.height),
-                payload,
-            }
+        let result = prepare(&self.chapter, &self.name, self.bounds).map(|page| PreparedPage {
+            native: page.native,
+            size: (page.width, page.height),
+            payload: Payload::new(self.file, page.rgb),
         });
         Prepared {
             reader_id: self.reader_id,
@@ -248,21 +262,9 @@ impl KittyView {
                     .get(&page)
                     .map_or_else(kitty::next_id, |sent| sent.id);
                 let placed = self.cells_for(state, page);
-                match prepared.payload {
-                    Payload::File(file) => {
-                        kitty::transmit_file(
-                            &mut self.output,
-                            id,
-                            prepared.size,
-                            file.path(),
-                            placed,
-                        );
-                        file.hand_over();
-                    }
-                    Payload::Rgb(rgb) => {
-                        kitty::transmit_direct(&mut self.output, id, prepared.size, &rgb, placed)
-                    }
-                }
+                prepared
+                    .payload
+                    .transmit(&mut self.output, id, prepared.size, placed);
                 self.sent.insert(
                     page,
                     Sent {
@@ -316,14 +318,8 @@ impl KittyView {
     }
 
     fn refresh_cell_size(&mut self) {
-        // Follows font size changes; the terminal reports its size in pixels and cells.
-        if let Ok(size) = crossterm::terminal::window_size()
-            && size.columns > 0
-            && size.rows > 0
-            && size.width > 0
-            && size.height > 0
-        {
-            self.cell = (size.width / size.columns, size.height / size.rows);
+        if let Some(cell) = terminal_cell() {
+            self.cell = cell;
         }
     }
 
@@ -383,6 +379,14 @@ impl KittyView {
             .find(|rect| rect.page == page)
             .map_or((1, 1), |rect| (rect.cols, rect.rows))
     }
+}
+
+/// The terminal's cell size in pixels, which follows font size changes; it reports its size in
+/// pixels and cells.
+pub(super) fn terminal_cell() -> Option<(u16, u16)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0)
+        .then(|| (size.width / size.columns, size.height / size.rows))
 }
 
 /// The views kept in the terminal, most urgent first: current, next, previous, the one after.
