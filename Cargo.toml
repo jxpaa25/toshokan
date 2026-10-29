@@ -2,6 +2,10 @@
 name = "toshokan"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
+description = "A terminal app for searching MangaDex, downloading chapters and reading them in the terminal"
+license = "MIT"
+repository = "https://github.com/jxpaa25/toshokan"
 
 [dependencies]
 base64-simd = "0.8"
