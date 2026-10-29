@@ -39,7 +39,7 @@ Picking chapters to download from a manga's page:
 
 ### What you need
 
-- Rust 1.90 or newer. [rustup](https://rustup.rs) is the easiest way to get it.
+- Rust 1.95 or newer. [rustup](https://rustup.rs) is the easiest way to get it.
 - A C compiler, since the TLS library builds a bit of C.
 - A terminal. Pages look best in Ghostty or kitty, where the terminal scales the images on the GPU and page turns are quick. Other terminals with Sixel or iTerm2 image support show real images as well. Everywhere else, and inside tmux, pages are drawn with half-block characters, which are readable but blurry.
 
