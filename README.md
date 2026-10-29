@@ -2,6 +2,8 @@
 
 toshokan (図書館, "library" in Japanese) is a manga reader that lives in your terminal. You search MangaDex, download the chapters you want, and read them right there, with real images if your terminal can draw them.
 
+Heads up: toshokan is vibe coded. It was built mostly by prompting an AI coding assistant (Claude Code) and steering what came back.
+
 ## What it does
 
 - Search MangaDex by title, or browse by status, demographic, year, tags and sort order.
