@@ -15,6 +15,26 @@ toshokan is vibe coded. It was built mostly by prompting an AI coding assistant 
 
 Adult titles stay hidden until you turn them on with F2.
 
+## Screenshots
+
+All of these were taken in Ghostty.
+
+Reading a chapter:
+
+![A Blue Lock page in the reader](docs/screenshots/reader.png)
+
+The library, with your reading progress and the new chapters waiting on MangaDex:
+
+![The library: a manga list with Berserk's cover, chapters marked read, and new chapters on MangaDex](docs/screenshots/library.png)
+
+Searching MangaDex:
+
+![Search results for "chainsaw man", with the cover and description of the top result](docs/screenshots/search.png)
+
+Picking chapters to download from a manga's page:
+
+![Chainsaw Man's English chapters, with four of them marked for download](docs/screenshots/manga.png)
+
 ## Setup
 
 ### What you need
