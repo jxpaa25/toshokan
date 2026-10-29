@@ -105,6 +105,12 @@ pub enum Action {
         page: usize,
         finished: bool,
     },
+    /// Mark these chapters (by file name) read or unread by hand.
+    SetRead {
+        manga: String,
+        chapters: Vec<String>,
+        read: bool,
+    },
     SetDirection {
         manga: String,
         direction: Direction,
@@ -218,6 +224,8 @@ pub struct App {
     /// Set while the library moves to a new download folder.
     moving: bool,
     overlay: Overlay,
+    /// Downloads or Settings was opened from the library, so closing it goes back there.
+    back_to_library: bool,
     dialog: Option<Dialog>,
     /// Drawn over everything else while open.
     reader: Option<ReaderScreen>,
@@ -272,6 +280,7 @@ pub async fn run(
         ),
         moving: false,
         overlay: Overlay::None,
+        back_to_library: false,
         dialog: None,
         reader: None,
         reader_preferences: (PageLayout::default(), Fit::default()),
@@ -283,6 +292,8 @@ pub async fn run(
         running: true,
         tick: 0,
     };
+    // The app opens on the library; Esc goes to search.
+    app.open_library();
     if let Some(warning) = warning {
         app.notify(warning);
     }
@@ -490,15 +501,32 @@ impl App {
 
     fn toggle_overlay(&mut self, overlay: Overlay) {
         if self.overlay == overlay {
+            self.close_overlay();
+        } else if overlay == Overlay::Library {
+            self.open_library();
+        } else {
+            self.back_to_library |= self.overlay == Overlay::Library;
+            self.overlay = overlay;
+        }
+    }
+
+    fn open_library(&mut self) {
+        // Pick up chapters (and covers) downloaded or added by hand since it was last open.
+        self.library.rescan(&self.reading);
+        self.library.set_over_manga(self.manga.is_some());
+        self.covers.forget_local();
+        self.overlay = Overlay::Library;
+        self.back_to_library = false;
+    }
+
+    /// Goes back to the library when Downloads or Settings was opened from it, else to the
+    /// search or manga screen underneath.
+    fn close_overlay(&mut self) {
+        if self.overlay != Overlay::Library && self.back_to_library {
+            self.open_library();
+        } else {
             self.overlay = Overlay::None;
-            return;
         }
-        if overlay == Overlay::Library {
-            // Pick up chapters (and covers) downloaded or added by hand since it was last open.
-            self.library.rescan(&self.reading);
-            self.covers.forget_local();
-        }
-        self.overlay = overlay;
     }
 
     fn handle_message(&mut self, message: Message) {
@@ -859,6 +887,18 @@ impl App {
                 self.reading.record(&manga, &chapter, page, finished);
                 self.save_reading();
             }
+            Action::SetRead {
+                manga,
+                chapters,
+                read,
+            } => {
+                for chapter in &chapters {
+                    self.reading.set_read(&manga, chapter, read);
+                }
+                self.save_reading();
+                // The online manga screen underneath shows which chapters are read too.
+                self.refresh_downloaded();
+            }
             Action::SetDirection { manga, direction } => {
                 self.reading.set_direction(&manga, direction);
                 self.save_reading();
@@ -878,11 +918,11 @@ impl App {
                 self.refresh_downloaded();
             }
             Action::CloseDialog => self.dialog = None,
-            Action::CloseOverlay => self.overlay = Overlay::None,
+            Action::CloseOverlay => self.close_overlay(),
             Action::Back => {
                 self.manga = None;
                 if self.manga_from_library.take().is_some() {
-                    self.toggle_overlay(Overlay::Library);
+                    self.open_library();
                 }
             }
             // Stopping halfway through a copy would leave a manga half in each folder.

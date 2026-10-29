@@ -1,5 +1,6 @@
 //! Library screen: manga in the download folder and their chapters, with reading progress
-//! and the chapters released on MangaDex since. Chapters and manga are deleted from here.
+//! and the chapters released on MangaDex since. Chapters are marked read or unread, and
+//! chapters and manga deleted, from here.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -51,8 +52,11 @@ pub struct LibraryScreen {
     checks: HashMap<String, Check>,
     /// Manga checked so far and in total, while a check runs.
     checking: Option<(usize, usize)>,
-    /// File names of the selected manga's chapters marked for deleting.
+    /// File names of the selected manga's chapters marked with Space, for deleting or
+    /// marking read.
     marked: HashSet<String>,
+    /// A manga screen is open underneath, so Esc goes back to it rather than to search.
+    over_manga: bool,
 }
 
 impl LibraryScreen {
@@ -68,7 +72,12 @@ impl LibraryScreen {
             checks: HashMap::new(),
             checking: None,
             marked: HashSet::new(),
+            over_manga: false,
         }
+    }
+
+    pub fn set_over_manga(&mut self, over_manga: bool) {
+        self.over_manga = over_manga;
     }
 
     /// Shows the library in another download folder.
@@ -302,6 +311,8 @@ impl LibraryScreen {
                             chapter: selected,
                         });
                     }
+                    KeyCode::Char('r') => return self.toggle_read(state),
+                    KeyCode::Char('R') => return self.read_up_to_selected(),
                     KeyCode::Char(' ') => {
                         let name = manga.chapters[selected].file_name.clone();
                         if !self.marked.remove(&name) {
@@ -352,6 +363,60 @@ impl LibraryScreen {
         self.chapter_list.select(Some(chapter));
         self.focus = Focus::Chapters;
         Some(Action::OpenReader { manga, chapter })
+    }
+
+    /// Marks the marked chapters read, or unread when they all are, and clears the marks;
+    /// with none marked, toggles the selected chapter.
+    fn toggle_read(&mut self, state: &ReadingState) -> Option<Action> {
+        let (chapters, read) = self.read_toggle(state)?;
+        let chapters: Vec<String> = chapters.iter().map(|c| c.file_name.clone()).collect();
+        if !self.marked.is_empty() {
+            let count = chapters.len();
+            let plural = if count == 1 { "" } else { "s" };
+            let read = if read { "read" } else { "unread" };
+            self.notice = Some(format!("Marked {count} chapter{plural} {read}"));
+            self.marked.clear();
+        }
+        Some(Action::SetRead {
+            manga: self.selected_manga()?.key.clone(),
+            chapters,
+            read,
+        })
+    }
+
+    /// The chapters `r` acts on (the marked ones, else the selected one) and whether it marks
+    /// them read: unless they're all read already.
+    fn read_toggle(&self, state: &ReadingState) -> Option<(Vec<&LocalChapter>, bool)> {
+        let manga = self.selected_manga()?;
+        let chapters: Vec<&LocalChapter> = if self.marked.is_empty() {
+            vec![manga.chapters.get(self.chapter_list.selected()?)?]
+        } else {
+            manga
+                .chapters
+                .iter()
+                .filter(|c| self.marked.contains(&c.file_name))
+                .collect()
+        };
+        let read = !chapters.iter().all(|c| is_read(state, manga, &c.file_name));
+        Some((chapters, read))
+    }
+
+    /// Marks every chapter from the first through the selected one read.
+    fn read_up_to_selected(&mut self) -> Option<Action> {
+        let manga = self.selected_manga()?;
+        let selected = self.chapter_list.selected()?;
+        let chapters = manga.chapters.get(..=selected)?;
+        let notice = format!(
+            "Marked every chapter up to {} read",
+            chapters[selected].name
+        );
+        let action = Action::SetRead {
+            manga: manga.key.clone(),
+            chapters: chapters.iter().map(|c| c.file_name.clone()).collect(),
+            read: true,
+        };
+        self.notice = Some(notice);
+        Some(action)
     }
 
     /// Asks to delete the selected manga, or the chapters marked in it.
@@ -476,7 +541,7 @@ impl LibraryScreen {
             let message = match &self.error {
                 Some(err) => vec![Line::from(format!("Couldn't read the download folder: {err}").red())],
                 None => vec![
-                    Line::from("Nothing here yet."),
+                    Line::from("Nothing here yet. Press Esc to search MangaDex for manga to download."),
                     Line::from(
                         format!(
                             "Downloads, plus any .cbz files or image folders you put in {}, show up here.",
@@ -512,26 +577,43 @@ impl LibraryScreen {
 
         let status = match &self.notice {
             Some(notice) => Line::from(notice.as_str().yellow()),
-            None => key_hints(&self.hints()),
+            None => key_hints(&self.hints(state)),
         };
         frame.render_widget(Paragraph::new(status), footer);
     }
 
-    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+    fn hints(&self, state: &ReadingState) -> Vec<(&'static str, &'static str)> {
+        let back = ("Esc", if self.over_manga { "back" } else { "search" });
+        let others = [back, ("F3", "downloads"), ("F5", "settings"), ("q", "quit")];
+        if self.manga.is_empty() {
+            return others.to_vec();
+        }
+        let toggle = match self.read_toggle(state) {
+            Some((_, false)) => ("r", "mark unread"),
+            _ => ("r", "mark read"),
+        };
         let mut hints = match self.focus {
             Focus::Manga => vec![("Enter", "chapters"), ("c", "continue"), ("x", "delete")],
-            Focus::Chapters if self.marked.is_empty() => {
-                vec![("Enter", "read"), ("c", "continue"), ("Space", "mark")]
-            }
-            Focus::Chapters => vec![("Enter", "read"), ("Space", "mark"), ("x", "delete marked")],
+            Focus::Chapters if self.marked.is_empty() => vec![
+                ("Enter", "read"),
+                ("c", "continue"),
+                ("Space", "mark"),
+                toggle,
+                ("R", "read up to here"),
+            ],
+            Focus::Chapters => vec![
+                ("Enter", "read"),
+                ("Space", "mark"),
+                toggle,
+                ("x", "delete marked"),
+            ],
         };
         hints.extend([
             ("d", "download new"),
             ("m", "MangaDex page"),
             ("u", "check for new"),
-            ("Esc", "back"),
-            ("q", "quit"),
         ]);
+        hints.extend(others);
         hints
     }
 
@@ -676,7 +758,7 @@ impl LibraryScreen {
                 let mut spans = vec![status, Span::raw(chapter.name.as_str())];
                 if !self.marked.is_empty() {
                     let mark = if self.marked.contains(&chapter.file_name) {
-                        "✗ ".red().bold()
+                        "• ".yellow().bold()
                     } else {
                         "  ".into()
                     };
@@ -911,7 +993,7 @@ mod tests {
         press(&mut screen, KeyCode::Char(' '));
         let text = render(&mut screen, &state);
         assert!(text.contains("Chapters · 2 marked"), "{text}");
-        assert!(text.contains("✗         Ch. 0001"));
+        assert!(text.contains("•         Ch. 0001"));
         assert!(text.contains("          Ch. 0002"));
         assert!(text.contains("x delete marked"));
         match press(&mut screen, KeyCode::Delete) {
@@ -933,6 +1015,98 @@ mod tests {
         press(&mut screen, KeyCode::Tab);
         press(&mut screen, KeyCode::Up);
         assert!(screen.marked.is_empty());
+    }
+
+    /// Does what the app does with `SetRead`, and returns the chapters and whether they're
+    /// now read.
+    fn set_read(action: Option<Action>, state: &mut ReadingState) -> (Vec<String>, bool) {
+        match action {
+            Some(Action::SetRead {
+                manga,
+                chapters,
+                read,
+            }) => {
+                for chapter in &chapters {
+                    state.set_read(&manga, chapter, read);
+                }
+                (chapters, read)
+            }
+            other => panic!("expected chapters marked read or unread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marks_chapters_read_and_unread_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        two_manga(dir.path());
+        let (mut state, _) = ReadingState::load(dir.path().join("state.json"));
+        state.record("Berserk", "Ch. 0002.cbz", 6, false);
+        let mut screen = LibraryScreen::new(dir.path().to_owned());
+        screen.rescan(&state);
+        assert!(
+            screen.handle_key(key(KeyCode::Char('r')), &state).is_none(),
+            "not on a manga"
+        );
+        screen.handle_key(key(KeyCode::Down), &state);
+        screen.handle_key(key(KeyCode::Enter), &state);
+        assert!(render(&mut screen, &state).contains("r mark read  R read up to here"));
+
+        // The selected chapter toggles.
+        let action = screen.handle_key(key(KeyCode::Char('r')), &state);
+        assert_eq!(
+            set_read(action, &mut state),
+            (vec!["Ch. 0001.cbz".to_owned()], true)
+        );
+        let text = render(&mut screen, &state);
+        assert!(text.contains("▶ ✓ read  Ch. 0001"), "{text}");
+        assert!(text.contains("r mark unread"));
+        let action = screen.handle_key(key(KeyCode::Char('r')), &state);
+        assert!(!set_read(action, &mut state).1);
+        assert_eq!(state.progress("Berserk", "Ch. 0001.cbz"), None);
+
+        // Everything up to the selected chapter.
+        screen.handle_key(key(KeyCode::Down), &state);
+        let action = screen.handle_key(key(KeyCode::Char('R')), &state);
+        assert_eq!(
+            set_read(action, &mut state),
+            (
+                vec!["Ch. 0001.cbz".to_owned(), "Ch. 0002.cbz".to_owned()],
+                true
+            )
+        );
+        let text = render(&mut screen, &state);
+        assert!(text.contains("Marked every chapter up to Ch. 0002 read"));
+        assert!(text.contains("4 chapters · 2 unread"), "{text}");
+
+        // Marked chapters: read unless they all are, then the marks go.
+        screen.handle_key(key(KeyCode::Char(' ')), &state);
+        screen.handle_key(key(KeyCode::Char(' ')), &state);
+        assert!(render(&mut screen, &state).contains("r mark read  x delete marked"));
+        let action = screen.handle_key(key(KeyCode::Char('r')), &state);
+        assert_eq!(
+            set_read(action, &mut state),
+            (
+                vec!["Ch. 0002.cbz".to_owned(), "Ch. 0003.cbz".to_owned()],
+                true
+            )
+        );
+        assert!(screen.marked.is_empty());
+        let text = render(&mut screen, &state);
+        assert!(text.contains("Marked 2 chapters read"));
+        assert!(text.contains("4 chapters · 1 unread"));
+
+        screen.chapter_list.select(Some(1));
+        screen.handle_key(key(KeyCode::Char(' ')), &state);
+        screen.handle_key(key(KeyCode::Char(' ')), &state);
+        assert!(render(&mut screen, &state).contains("r mark unread  x delete marked"));
+        let action = screen.handle_key(key(KeyCode::Char('r')), &state);
+        assert!(!set_read(action, &mut state).1);
+        assert!(render(&mut screen, &state).contains("Marked 2 chapters unread"));
+        assert_eq!(
+            state.progress("Berserk", "Ch. 0002.cbz"),
+            None,
+            "starts over"
+        );
     }
 
     #[test]
@@ -1148,6 +1322,29 @@ mod tests {
         terminal
             .draw(|frame| screen.render(frame, frame.area(), &state, "⠋"))
             .unwrap();
-        assert!(buffer_text(&terminal).contains("Nothing here yet."));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Nothing here yet. Press Esc to search MangaDex"));
+        // Only keys that do something with nothing listed.
+        assert!(text.contains("Esc search  F3 downloads  F5 settings  q quit"));
+        assert!(!text.contains("continue"));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Esc), &state),
+            Some(Action::CloseOverlay)
+        ));
+    }
+
+    #[test]
+    fn esc_goes_back_to_the_manga_screen_it_was_opened_over() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Oneshot.cbz"), b"").unwrap();
+        let (state, _) = ReadingState::load(dir.path().join("state.json"));
+        let mut screen = LibraryScreen::new(dir.path().to_owned());
+        screen.rescan(&state);
+        assert!(render(&mut screen, &state).contains("Esc search"));
+
+        screen.set_over_manga(true);
+        let text = render(&mut screen, &state);
+        assert!(text.contains("Esc back"));
+        assert!(!text.contains("Esc search"));
     }
 }

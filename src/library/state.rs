@@ -110,6 +110,22 @@ impl ReadingState {
         progress.read |= finished;
     }
 
+    /// Marks a chapter read or unread by hand. An unread chapter starts over from its first
+    /// page, as if it had never been opened.
+    pub fn set_read(&mut self, manga: &str, chapter: &str, read: bool) {
+        if !read {
+            self.forget_chapter(manga, chapter);
+            return;
+        }
+        self.manga
+            .entry(manga.to_owned())
+            .or_default()
+            .chapters
+            .entry(chapter.to_owned())
+            .or_default()
+            .read = true;
+    }
+
     /// Forgets a chapter's progress, e.g. once it's deleted.
     pub fn forget_chapter(&mut self, manga: &str, chapter: &str) {
         if let Some(state) = self.manga.get_mut(manga) {
@@ -168,6 +184,35 @@ mod tests {
         state.forget_manga("Berserk");
         assert_eq!(state.direction("Berserk"), Direction::Rtl);
         assert_eq!(state.strip("Berserk"), None);
+    }
+
+    #[test]
+    fn marks_chapters_read_and_unread_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _) = ReadingState::load(dir.path().join("library.json"));
+        state.record("Berserk", "Ch. 0001.cbz", 6, false);
+        state.set_read("Berserk", "Ch. 0001.cbz", true);
+        state.set_read("Berserk", "Ch. 0002.cbz", true);
+        assert_eq!(
+            state.progress("Berserk", "Ch. 0001.cbz"),
+            Some(Progress {
+                page: 6,
+                read: true
+            }),
+            "keeps the page"
+        );
+        assert_eq!(
+            state.progress("Berserk", "Ch. 0002.cbz"),
+            Some(Progress {
+                page: 0,
+                read: true
+            })
+        );
+
+        state.set_read("Berserk", "Ch. 0001.cbz", false);
+        assert_eq!(state.progress("Berserk", "Ch. 0001.cbz"), None);
+        state.set_read("Akira", "Ch. 0001.cbz", false);
+        assert_eq!(state.progress("Akira", "Ch. 0001.cbz"), None);
     }
 
     #[test]
