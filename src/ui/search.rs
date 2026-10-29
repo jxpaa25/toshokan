@@ -4,14 +4,16 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{ListItem, ListState, Paragraph, Wrap};
 
 use super::cover::{CoverSource, cover_rect};
 use super::filters::{self, Closed, FilterPopup, TagList};
 use super::input::TextInput;
-use super::{join_spans, key_hints, panel, rating_span, strip_link_section};
+use super::{
+    join_spans, key_hints, panel, rating_span, render_list, selectable_list, strip_link_section,
+};
 use crate::api::{ContentRating, Manga, SEARCH_PAGE_SIZE, SearchFilters, SearchPage, Tag};
 use crate::app::Action;
 use crate::config::Settings;
@@ -346,15 +348,12 @@ impl SearchScreen {
         }
 
         let items: Vec<ListItem> = self.results.iter().map(result_item).collect();
-        let list = List::new(items)
-            .block(block)
-            .highlight_symbol("▶ ")
-            .highlight_style(
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-        frame.render_stateful_widget(list, area, &mut self.list);
+        render_list(
+            frame,
+            selectable_list(items).block(block),
+            area,
+            &mut self.list,
+        );
     }
 
     fn render_details(&self, frame: &mut Frame, area: Rect) {

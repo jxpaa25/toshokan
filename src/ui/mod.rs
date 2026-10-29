@@ -16,9 +16,11 @@ pub mod settings;
 
 use std::path::Path;
 
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Block;
+use ratatui::widgets::{Block, List, ListItem, ListState};
 
 use crate::api::ContentRating;
 
@@ -36,6 +38,29 @@ pub(crate) fn border_style(focused: bool) -> Style {
         Color::DarkGray
     };
     Style::new().fg(border)
+}
+
+/// A list that marks its selected row with ▶ on a dark grey background. Draw it with
+/// [`render_list`].
+pub(crate) fn selectable_list<'a>(items: Vec<ListItem<'a>>) -> List<'a> {
+    List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::new()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Draws a [`selectable_list`]. Text dimmed with dark grey (meta lines, language codes)
+/// would vanish into the selected row's background, so on that row it's drawn grey.
+pub(crate) fn render_list(frame: &mut Frame, list: List, area: Rect, state: &mut ListState) {
+    frame.render_stateful_widget(list, area, state);
+    let buffer = frame.buffer_mut();
+    for position in area.positions() {
+        let cell = &mut buffer[position];
+        if cell.bg == Color::DarkGray && cell.fg == Color::DarkGray {
+            cell.set_fg(Color::Gray);
+        }
+    }
 }
 
 pub(crate) fn rating_span(rating: ContentRating) -> Span<'static> {
@@ -145,7 +170,29 @@ pub(crate) fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBac
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
     use super::*;
+
+    #[test]
+    fn dim_text_on_the_selected_row_stays_readable() {
+        let items = ["one", "two"]
+            .map(|name| ListItem::new(Line::from(vec![Span::raw(name), " meta".dark_gray()])))
+            .to_vec();
+        let mut state = ListState::default().with_selected(Some(0));
+        let mut terminal = Terminal::new(TestBackend::new(12, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_list(frame, selectable_list(items), area, &mut state);
+            })
+            .unwrap();
+        assert_eq!(buffer_text(&terminal), "▶ one meta  \n  two meta  ");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(6, 0)].fg, Color::Gray);
+        assert_eq!(buffer[(6, 1)].fg, Color::DarkGray);
+    }
 
     #[test]
     fn formats_sizes() {

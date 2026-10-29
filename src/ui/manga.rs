@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{ListItem, ListState, Paragraph, Wrap};
 
 use super::cover::{CoverSource, cover_rect};
 use super::languages::language_name;
-use super::{groups_label, join_spans, key_hints, panel, rating_span, strip_link_section};
+use super::{
+    groups_label, join_spans, key_hints, panel, rating_span, render_list, selectable_list,
+    strip_link_section,
+};
 use crate::api::{Chapter, ChapterSlot, Manga};
 use crate::app::Action;
 
@@ -433,7 +436,12 @@ impl MangaScreen {
                 ]))
             })
             .collect();
-        frame.render_stateful_widget(list_widget(items, block), area, &mut self.language_list);
+        render_list(
+            frame,
+            selectable_list(items).block(block),
+            area,
+            &mut self.language_list,
+        );
     }
 
     fn render_chapters(&mut self, frame: &mut Frame, area: Rect, spinner: &str) {
@@ -462,8 +470,9 @@ impl MangaScreen {
                 let items: Vec<ListItem> = (0..list.slots.len())
                     .map(|index| chapter_item(list, index, &self.downloaded))
                     .collect();
-                frame.render_stateful_widget(
-                    list_widget(items, block),
+                render_list(
+                    frame,
+                    selectable_list(items).block(block),
                     area,
                     &mut self.chapter_list,
                 );
@@ -519,17 +528,6 @@ impl MangaScreen {
         };
         frame.render_widget(Paragraph::new(status), area);
     }
-}
-
-fn list_widget<'a>(items: Vec<ListItem<'a>>, block: ratatui::widgets::Block<'a>) -> List<'a> {
-    List::new(items)
-        .block(block)
-        .highlight_symbol("▶ ")
-        .highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
 }
 
 fn chapter_item<'a>(

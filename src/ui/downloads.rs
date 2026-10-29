@@ -4,11 +4,11 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{ListItem, ListState, Paragraph};
 
-use super::{display_path, key_hints, panel, truncate_start};
+use super::{display_path, key_hints, panel, render_list, selectable_list, truncate_start};
 use crate::app::Action;
 use crate::download::{Event, Job, SavedChapter, SavedQueue, Update};
 
@@ -318,15 +318,12 @@ impl DownloadsScreen {
                 .iter()
                 .map(|entry| entry_item(entry, spinner, self.paused))
                 .collect();
-            let list = List::new(items)
-                .block(block)
-                .highlight_symbol("▶ ")
-                .highlight_style(
-                    Style::new()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                );
-            frame.render_stateful_widget(list, body, &mut self.list);
+            render_list(
+                frame,
+                selectable_list(items).block(block),
+                body,
+                &mut self.list,
+            );
         }
 
         let status = match &self.notice {

@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, ListItem, ListState, Paragraph};
 
 use super::input::TextInput;
 use super::languages::{LANGUAGES, language_name};
-use super::{display_path, key_hints, panel, truncate_start};
+use super::{display_path, key_hints, panel, render_list, selectable_list, truncate_start};
 use crate::api::Quality;
 use crate::app::Action;
 use crate::config::{Settings, expand_home};
@@ -382,12 +382,7 @@ fn render_language_picker(
                 ]))
             })
             .collect();
-        let widget = List::new(items).highlight_symbol("▶ ").highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-        frame.render_stateful_widget(widget, choices, list);
+        render_list(frame, selectable_list(items), choices, list);
     }
     let keys = key_hints(&[("type", "to find"), ("Enter", "set"), ("Esc", "cancel")]);
     frame.render_widget(Paragraph::new(keys), hints);

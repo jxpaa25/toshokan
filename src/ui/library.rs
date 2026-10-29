@@ -8,12 +8,15 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, ListItem, ListState, Paragraph, Wrap};
 
 use super::cover::{CoverSource, cover_rect};
-use super::{border_style, display_path, groups_label, key_hints, panel, truncate_start};
+use super::{
+    border_style, display_path, groups_label, key_hints, panel, render_list, selectable_list,
+    truncate_start,
+};
 use crate::app::{Action, LookUp};
 use crate::library::delete::Deletion;
 use crate::library::state::ReadingState;
@@ -694,8 +697,9 @@ impl LibraryScreen {
         let focused = self.focus == Focus::Manga;
         frame.render_widget(panel(&title, focused), area);
         let (list_area, cover) = manga_pane_layout(area);
-        frame.render_stateful_widget(
-            list(items, Block::default()),
+        render_list(
+            frame,
+            selectable_list(items),
             list_area,
             &mut self.manga_list,
         );
@@ -772,7 +776,12 @@ impl LibraryScreen {
                 ListItem::new(Line::from(spans))
             })
             .collect();
-        frame.render_stateful_widget(list(items, block), area, &mut self.chapter_list);
+        render_list(
+            frame,
+            selectable_list(items).block(block),
+            area,
+            &mut self.chapter_list,
+        );
     }
 }
 
@@ -861,17 +870,6 @@ fn not_found(manga: &LibraryManga) -> String {
 
 fn is_read(state: &ReadingState, manga: &LibraryManga, chapter: &str) -> bool {
     state.progress(&manga.key, chapter).is_some_and(|p| p.read)
-}
-
-fn list<'a>(items: Vec<ListItem<'a>>, block: Block<'a>) -> List<'a> {
-    List::new(items)
-        .block(block)
-        .highlight_symbol("▶ ")
-        .highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
 }
 
 #[cfg(test)]
