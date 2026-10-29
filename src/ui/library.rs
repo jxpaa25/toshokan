@@ -309,6 +309,7 @@ impl LibraryScreen {
                         return Some(Action::OpenReader {
                             manga: manga.clone(),
                             chapter: selected,
+                            at_end: false,
                         });
                     }
                     KeyCode::Char('r') => return self.toggle_read(state),
@@ -362,7 +363,11 @@ impl LibraryScreen {
         };
         self.chapter_list.select(Some(chapter));
         self.focus = Focus::Chapters;
-        Some(Action::OpenReader { manga, chapter })
+        Some(Action::OpenReader {
+            manga,
+            chapter,
+            at_end: false,
+        })
     }
 
     /// Marks the marked chapters read, or unread when they all are, and clears the marks;
@@ -911,7 +916,11 @@ mod tests {
 
         screen.handle_key(key(KeyCode::Enter), &state);
         match screen.handle_key(key(KeyCode::Enter), &state) {
-            Some(Action::OpenReader { chapter, manga }) => {
+            Some(Action::OpenReader {
+                chapter,
+                manga,
+                at_end: false,
+            }) => {
                 assert_eq!(chapter, 1);
                 assert_eq!(manga.key, "Berserk");
             }

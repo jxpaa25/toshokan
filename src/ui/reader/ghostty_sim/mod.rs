@@ -21,7 +21,7 @@ use ratatui_image::picker::Picker;
 
 use self::model::{Ghostty, Location, PLACEHOLDER, Screen};
 use super::layout::{PageRect, place};
-use super::{Fit, Graphics, PageLayout, ReaderJob, ReaderScreen, split};
+use super::{Fit, Graphics, PageLayout, Prompt, ReaderJob, ReaderScreen, split};
 use crate::app::Action;
 use crate::library::state::{Direction, ReadingState};
 use crate::library::{ChapterKind, LibraryManga, LocalChapter};
@@ -204,7 +204,8 @@ impl Harness {
             kitty: Some(medium),
         };
         let cell = app_cell();
-        let (reader, _) = ReaderScreen::new(book.manga.clone(), 0, &state, &graphics, layout, fit);
+        let (reader, _) =
+            ReaderScreen::new(book.manga.clone(), 0, false, &state, &graphics, layout, fit);
         let mut harness = Harness {
             book,
             shm,
@@ -317,11 +318,16 @@ impl Harness {
                 let mut reader = self.reader.take().unwrap();
                 self.pending_output.extend(reader.close());
             }
-            Some(Action::OpenReader { manga, chapter }) => {
+            Some(Action::OpenReader {
+                manga,
+                chapter,
+                at_end,
+            }) => {
                 let (layout, fit) = self.reader().preferences();
                 let (screen, _) = ReaderScreen::new(
                     manga.clone(),
                     *chapter,
+                    *at_end,
                     &self.state,
                     &self.graphics,
                     layout,
@@ -494,14 +500,14 @@ impl Harness {
                 let r = &reader.reading;
                 let strip = r.strip.as_ref().unwrap();
                 format!(
-                    "chapter {} strip at page {} +{:.3}, scroll {} of {:?} rows, {:?}, popup {}, {} images {:?}",
+                    "chapter {} strip at page {} +{:.3}, scroll {} of {:?} rows, {:?}, popup {:?}, {} images {:?}",
                     r.chapter,
                     strip.page,
                     strip.offset,
                     strip.scroll,
                     strip.layout.as_ref().map(|l| l.total_rows()),
                     r.fit,
-                    reader.end_prompt,
+                    reader.prompt,
                     self.ghostty.images.len(),
                     self.ghostty
                         .images
@@ -513,7 +519,7 @@ impl Harness {
             Some(reader) => {
                 let r = &reader.reading;
                 format!(
-                    "chapter {} view {} {:?} of {:?}, {:?} {:?} {:?}, scroll {}/{}, popup {}, {} images {:?}",
+                    "chapter {} view {} {:?} of {:?}, {:?} {:?} {:?}, scroll {}/{}, popup {:?}, {} images {:?}",
                     r.chapter,
                     r.view,
                     r.views.get(r.view),
@@ -523,7 +529,7 @@ impl Harness {
                     r.direction,
                     r.scroll,
                     r.max_scroll,
-                    reader.end_prompt,
+                    reader.prompt,
                     self.ghostty.images.len(),
                     self.ghostty
                         .images
@@ -639,8 +645,15 @@ impl Harness {
         }
 
         let text = crate::ui::buffer_text(&self.terminal);
-        if reader.end_prompt && !text.contains("End of chapter") {
-            problems.push("the end-of-chapter popup isn't drawn".into());
+        let heading = match reader.prompt {
+            Some(Prompt::Previous) => Some("Start of chapter"),
+            Some(Prompt::Next) => Some("End of chapter"),
+            None => None,
+        };
+        if let Some(heading) = heading
+            && !text.contains(heading)
+        {
+            problems.push(format!("the \"{heading}\" popup isn't drawn"));
         }
         if !r.can_show() {
             if !screen.placeholder_cells.is_empty() {
@@ -697,10 +710,10 @@ impl Harness {
                 }
             }
         }
-        if reader.end_prompt != popup.is_some() {
+        if reader.prompt.is_some() != popup.is_some() {
             problems.push(format!(
-                "popup shown: {}, text in the page area: {popup:?}",
-                reader.end_prompt
+                "popup shown: {:?}, text in the page area: {popup:?}",
+                reader.prompt
             ));
         }
         let in_popup = |x: u16, y: u16| popup.is_some_and(|p| p.contains((x, y).into()));
@@ -1160,10 +1173,10 @@ impl Harness {
             ));
         }
         let popup = popup_box(buf, area);
-        if reader.end_prompt != popup.is_some() {
+        if reader.prompt.is_some() != popup.is_some() {
             problems.push(format!(
-                "popup shown: {}, popup box on screen: {popup:?}",
-                reader.end_prompt
+                "popup shown: {:?}, popup box on screen: {popup:?}",
+                reader.prompt
             ));
         }
         let in_popup = |x: u16, y: u16| popup.is_some_and(|p| p.contains((x, y).into()));
@@ -1567,7 +1580,7 @@ fn end_of_chapter_popup_next_chapter_and_close() {
     h.settle();
     h.press(KeyCode::End);
     assert!(h.key(KeyCode::Right).is_none());
-    assert!(h.reader().end_prompt);
+    assert!(h.reader().prompt.is_some());
     h.settle();
     // Cells around the popup still show the right part of the page.
     let rect = h.rect(7);
@@ -1575,7 +1588,7 @@ fn end_of_chapter_popup_next_chapter_and_close() {
     let (p, u, _) = h.shown_at(rect.area.right() - 1, mid);
     assert!(p == 7 && u > 0.95);
     h.press(KeyCode::Esc);
-    assert!(!h.reader().end_prompt);
+    assert!(!h.reader().prompt.is_some());
     // The popup over a scrolled spread.
     h.press(KeyCode::Char('s'));
     h.press(KeyCode::Left);
@@ -1585,12 +1598,12 @@ fn end_of_chapter_popup_next_chapter_and_close() {
     }
     h.press(KeyCode::Right);
     h.press(KeyCode::Right);
-    assert!(h.reader().end_prompt);
+    assert!(h.reader().prompt.is_some());
     h.press(KeyCode::Esc);
     h.press(KeyCode::Char('f'));
     h.press(KeyCode::Char('s'));
     h.press(KeyCode::Right);
-    assert!(h.reader().end_prompt);
+    assert!(h.reader().prompt.is_some());
     let old_ids: Vec<u32> = h.ghostty.images.keys().copied().collect();
     match h.key(KeyCode::Enter) {
         Some(Action::OpenReader { chapter: 1, .. }) => {}
@@ -1602,10 +1615,58 @@ fn end_of_chapter_popup_next_chapter_and_close() {
     h.press(KeyCode::Right);
     h.press(KeyCode::Right);
     h.press(KeyCode::Right);
-    assert!(h.reader().end_prompt, "last downloaded chapter");
+    assert!(h.reader().prompt.is_some(), "last downloaded chapter");
     h.press(KeyCode::Esc);
     assert!(matches!(h.key(KeyCode::Esc), Some(Action::CloseReader)));
     assert!(h.ghostty.images.is_empty() && h.ghostty.placements.is_empty());
+}
+
+#[test]
+fn start_of_chapter_popup_opens_the_previous_chapter_at_its_end() {
+    let mut h = Harness::new(
+        &[portrait_chapter(), short_chapter()],
+        Via::Direct,
+        (120, 40),
+    );
+    h.settle();
+    assert!(h.key(KeyCode::Left).is_none());
+    assert_eq!(h.reader().prompt, Some(Prompt::Previous));
+    assert!(crate::ui::buffer_text(&h.terminal).contains("This is the first downloaded chapter."));
+    h.settle();
+    assert!(
+        h.key(KeyCode::Enter).is_none(),
+        "nothing before the first chapter"
+    );
+    assert_eq!(h.reader().prompt, None);
+    h.press(KeyCode::End);
+    h.press(KeyCode::Right);
+    h.press(KeyCode::Enter);
+    assert_eq!(h.reader().reading.chapter, 1);
+
+    h.press(KeyCode::PageUp);
+    assert_eq!(h.reader().prompt, Some(Prompt::Previous));
+    assert!(crate::ui::buffer_text(&h.terminal).contains("Previous: Chapter 1"));
+    let old_ids: Vec<u32> = h.ghostty.images.keys().copied().collect();
+    match h.key(KeyCode::Enter) {
+        Some(Action::OpenReader {
+            chapter: 0,
+            at_end: true,
+            ..
+        }) => {}
+        other => panic!("expected the previous chapter at its end, got {other:?}"),
+    }
+    h.settle();
+    assert_eq!(h.reader().reading.chapter, 0);
+    assert_eq!(h.view_pages(), [7]);
+    assert!(old_ids.iter().all(|id| !h.ghostty.images.contains_key(id)));
+    assert_eq!(
+        h.state
+            .progress("Sim", "Chapter 1")
+            .map(|p| (p.page, p.read)),
+        Some((7, true))
+    );
+    h.press(KeyCode::Left);
+    assert_eq!(h.view_pages(), [6]);
 }
 
 #[test]
@@ -1643,7 +1704,7 @@ fn results_arriving_after_the_reader_moved_on() {
         h.key(KeyCode::Left);
         h.key(KeyCode::End);
         h.key(KeyCode::Right);
-        assert!(h.reader().end_prompt);
+        assert!(h.reader().prompt.is_some());
         h.key(KeyCode::Enter);
         while !h.jobs.is_empty() {
             h.finish_job();
@@ -1739,7 +1800,7 @@ fn popup_over_a_spread_in_both_directions() {
     h.press(KeyCode::End);
     assert_eq!(h.view_pages(), [5, 6]);
     h.press(KeyCode::Right);
-    assert!(h.reader().end_prompt);
+    assert!(h.reader().prompt.is_some());
     // The popup sits across the seam; both pages around it are intact.
     let (left, right) = (h.last_rects[0], h.last_rects[1]);
     assert_eq!((left.page, right.page), (6, 5));
@@ -1749,9 +1810,12 @@ fn popup_over_a_spread_in_both_directions() {
     let (p, u, _) = h.shown_at(left.area.x, mid);
     assert!(p == 6 && u < 0.05);
     h.press(KeyCode::Char('r'));
-    assert!(!h.reader().end_prompt, "any other key closes the popup");
+    assert!(
+        !h.reader().prompt.is_some(),
+        "any other key closes the popup"
+    );
     h.press(KeyCode::Right);
-    assert!(h.reader().end_prompt);
+    assert!(h.reader().prompt.is_some());
     assert_eq!(h.last_rects[0].page, 5, "left to right");
     h.press(KeyCode::Char('f'));
     h.press(KeyCode::Right);
@@ -1850,7 +1914,7 @@ fn long_strips_scroll_continuously_through_the_chapter() {
     }
     assert_eq!(last, h.strip_max_scroll());
     assert!(
-        h.reader().end_prompt,
+        h.reader().prompt.is_some(),
         "going on past the end offers the next chapter"
     );
     assert_eq!(
@@ -1877,7 +1941,7 @@ fn long_strips_scroll_continuously_through_the_chapter() {
     h.press(KeyCode::Char('s'));
     assert!(h.reader().notice.is_some(), "no spreads in a strip");
     h.press(KeyCode::Down);
-    assert!(h.reader().end_prompt);
+    assert!(h.reader().prompt.is_some());
     match h.key(KeyCode::Enter) {
         Some(Action::OpenReader { chapter: 1, .. }) => {}
         other => panic!("expected the next chapter, got {other:?}"),
@@ -1888,6 +1952,50 @@ fn long_strips_scroll_continuously_through_the_chapter() {
     assert!(matches!(h.key(KeyCode::Esc), Some(Action::CloseReader)));
     assert!(h.ghostty.images.is_empty() && h.ghostty.placements.is_empty());
     assert!(h.cells_checked.get() > 100_000, "{}", h.cells_checked.get());
+}
+
+#[test]
+fn going_back_from_a_strip_opens_the_previous_chapter_at_its_bottom() {
+    let mut h = Harness::new(&[strip_chapter(), strip_chapter()], Via::Direct, (100, 30));
+    h.settle();
+    h.press(KeyCode::End);
+    h.press(KeyCode::Down);
+    h.press(KeyCode::Enter);
+    assert_eq!((h.reader().reading.chapter, h.strip_scroll()), (1, 0));
+
+    h.press(KeyCode::Char('k'));
+    assert_eq!(h.reader().prompt, Some(Prompt::Previous));
+    h.wheel(false);
+    assert_eq!(
+        h.reader().prompt,
+        Some(Prompt::Previous),
+        "more of the same keeps it"
+    );
+    h.settle();
+    match h.key(KeyCode::Enter) {
+        Some(Action::OpenReader {
+            chapter: 0,
+            at_end: true,
+            ..
+        }) => {}
+        other => panic!("expected the previous chapter at its end, got {other:?}"),
+    }
+    h.settle();
+    assert_eq!(h.reader().reading.chapter, 0);
+    assert_eq!(h.strip_scroll(), h.strip_max_scroll());
+    assert_eq!(
+        h.state
+            .progress("Sim", "Chapter 1")
+            .map(|p| (p.page, p.read)),
+        Some((6, true))
+    );
+    // It stays at the bottom through a resize, and scrolls up from there.
+    h.resize(140, 40);
+    assert_eq!(h.strip_scroll(), h.strip_max_scroll());
+    let bottom = h.strip_scroll();
+    h.press(KeyCode::Char('k'));
+    assert_eq!(h.strip_scroll(), bottom - 3);
+    assert_eq!(h.reader().prompt, None);
 }
 
 #[test]
@@ -1990,6 +2098,7 @@ fn switching_between_strip_and_pages() {
     let (reader, _) = ReaderScreen::new(
         h.book.manga.clone(),
         0,
+        false,
         &h.state,
         &h.graphics,
         PageLayout::Single,

@@ -98,6 +98,8 @@ pub enum Action {
     OpenReader {
         manga: LibraryManga,
         chapter: usize,
+        /// Open at the last page instead of where the user left off (going back a chapter).
+        at_end: bool,
     },
     SaveProgress {
         manga: String,
@@ -862,14 +864,25 @@ impl App {
             Action::CheckForNew => self.check_for_new(true),
             Action::LookUpManga { id, then } => self.spawn_look_up(id, then),
             Action::ReadDownloaded { manga, chapter } => self.read_downloaded(&manga, &chapter),
-            Action::OpenReader { manga, chapter } => {
+            Action::OpenReader {
+                manga,
+                chapter,
+                at_end,
+            } => {
                 let (layout, fit) = match &self.reader {
                     Some(reader) => reader.preferences(),
                     None => self.reader_preferences,
                 };
-                let (screen, action) =
-                    ReaderScreen::new(manga, chapter, &self.reading, &self.graphics, layout, fit);
-                // Opening the next chapter replaces the reader; free the old one's images.
+                let (screen, action) = ReaderScreen::new(
+                    manga,
+                    chapter,
+                    at_end,
+                    &self.reading,
+                    &self.graphics,
+                    layout,
+                    fit,
+                );
+                // Opening another chapter replaces the reader; free the old one's images.
                 match self.reader.replace(screen) {
                     Some(mut old) => self.terminal_output.extend(old.close()),
                     None => self.terminal_output.extend(MOUSE_ON),
@@ -1015,6 +1028,7 @@ impl App {
                 Some(index) => self.perform(Action::OpenReader {
                     manga: local,
                     chapter: index,
+                    at_end: false,
                 }),
                 None => self.notify("That chapter isn't on disk anymore".to_owned()),
             },

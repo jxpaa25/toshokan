@@ -188,6 +188,15 @@ impl Display {
     }
 }
 
+/// The popup offering another chapter, shown on going on past either end of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prompt {
+    /// Before the first page.
+    Previous,
+    /// After the last page.
+    Next,
+}
+
 /// Where the reader is in a long strip.
 struct Strip {
     /// Every page's pixel size once measured; `None` for a page that can't be read.
@@ -196,7 +205,8 @@ struct Strip {
     /// The strip's width in pixels, from the pages' sizes.
     width: u32,
     /// The page at the top of the screen and how far down it the screen starts (0..1): a
-    /// share of the page, so resizing keeps the reader's place.
+    /// share of the page, so resizing keeps the reader's place. 1 on the last page means the
+    /// bottom of the strip, for a chapter opened at its end.
     page: usize,
     offset: f64,
     /// This frame's layout, once the pages are measured, and how far it's scrolled.
@@ -336,8 +346,12 @@ impl Reading {
 
     /// Whether the bottom of the strip is on screen.
     fn strip_at_end(&self) -> bool {
-        self.strip_position()
-            .is_some_and(|(layout, scroll)| scroll >= layout.max_scroll())
+        match (self.strip_position(), &self.strip) {
+            (Some((layout, scroll)), _) => scroll >= layout.max_scroll(),
+            // Not laid out yet: only when opened at the end.
+            (None, Some(strip)) => strip.offset >= 1.0,
+            (None, None) => false,
+        }
     }
 }
 
@@ -348,7 +362,7 @@ pub struct ReaderScreen {
     graphics: Graphics,
     /// What a display that was replaced left to write to the terminal.
     output: Vec<u8>,
-    end_prompt: bool,
+    prompt: Option<Prompt>,
     notice: Option<String>,
     /// The last page turned with the mouse wheel.
     wheel_turn: Option<Instant>,
@@ -357,11 +371,12 @@ pub struct ReaderScreen {
 }
 
 impl ReaderScreen {
-    /// Opens `manga.chapters[chapter]` where the user left off, and returns the progress to
-    /// record for opening it.
+    /// Opens `manga.chapters[chapter]` where the user left off, or at its last page with
+    /// `at_end`, and returns the progress to record for opening it.
     pub fn new(
         manga: LibraryManga,
         chapter: usize,
+        at_end: bool,
         state: &ReadingState,
         graphics: &Graphics,
         layout: PageLayout,
@@ -377,6 +392,7 @@ impl ReaderScreen {
         let view_of = |page: usize| views.iter().position(|v| v.contains(&page));
         // A finished chapter left on its last page starts over instead.
         let view = match state.progress(&manga.key, &local.file_name) {
+            _ if at_end => last_view,
             Some(progress) => match view_of(progress.page) {
                 Some(view) if progress.read && view == last_view => 0,
                 Some(view) => view,
@@ -389,6 +405,11 @@ impl ReaderScreen {
                 .strip(&manga.key)
                 .unwrap_or_else(|| is_long_strip(local, &pages));
         let first_page = views.get(view).map_or(0, |view| view[0]);
+        let strip = strip.then(|| Strip {
+            offset: if at_end { 1.0 } else { 0.0 },
+            ..Strip::at(first_page)
+        });
+        let display = Display::new(graphics, strip.is_some());
         let mut screen = ReaderScreen {
             reading: Reading {
                 id: NEXT_READER_ID.fetch_add(1, Ordering::Relaxed),
@@ -403,18 +424,23 @@ impl ReaderScreen {
                 view,
                 scroll: 0,
                 max_scroll: 0,
-                strip: strip.then(|| Strip::at(first_page)),
+                strip,
             },
-            display: Display::new(graphics, strip),
+            display,
             graphics: graphics.clone(),
             output: Vec::new(),
-            end_prompt: false,
+            prompt: None,
             notice: None,
             wheel_turn: None,
             saved: None,
         };
         let action = screen.reading.progress_action();
-        screen.saved = strip.then_some((first_page, false));
+        let reading = &screen.reading;
+        let saved = reading
+            .strip
+            .is_some()
+            .then(|| (first_page, reading.strip_at_end()));
+        screen.saved = saved;
         (screen, action)
     }
 
@@ -557,10 +583,9 @@ impl ReaderScreen {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
-        if self.end_prompt {
-            self.end_prompt = false;
+        if let Some(prompt) = self.prompt.take() {
             match key.code {
-                KeyCode::Enter => return self.next_chapter(),
+                KeyCode::Enter => return self.open_offered(prompt),
                 KeyCode::Esc => return None,
                 _ => {}
             }
@@ -600,11 +625,12 @@ impl ReaderScreen {
             _ => return None,
         };
         self.notice = None;
-        if self.end_prompt {
-            if down {
+        if let Some(prompt) = self.prompt {
+            // Going on past the end keeps the popup up; going back closes it.
+            if down == (prompt == Prompt::Next) {
                 return None;
             }
-            self.end_prompt = false;
+            self.prompt = None;
         }
         let step = i64::from(SCROLL_STEP) * if down { 1 } else { -1 };
         if self.reading.strip.is_some() {
@@ -629,7 +655,7 @@ impl ReaderScreen {
         if down {
             return self.next_view();
         }
-        let action = self.go_to(self.reading.view.saturating_sub(1));
+        let action = self.previous_view();
         if self.reading.fit == Fit::Width && action.is_some() {
             // Scrolling up reaches the bottom of the page before.
             self.reading.scroll = u16::MAX;
@@ -644,10 +670,7 @@ impl ReaderScreen {
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::PageDown => {
                 self.next_view()
             }
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::PageUp => {
-                let previous = reading.view.saturating_sub(1);
-                self.go_to(previous)
-            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::PageUp => self.previous_view(),
             KeyCode::Home => self.go_to(0),
             KeyCode::End => self.go_to(last_view),
             KeyCode::Down | KeyCode::Char('j') if reading.fit == Fit::Width => {
@@ -687,12 +710,12 @@ impl ReaderScreen {
         let step = i64::from(SCROLL_STEP);
         match code {
             KeyCode::Down | KeyCode::Char('j') => self.scroll_strip(step, true),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_strip(-step, false),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_strip(-step, true),
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::PageDown => {
                 self.scroll_strip(screen, true)
             }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::PageUp => {
-                self.scroll_strip(-screen, false)
+                self.scroll_strip(-screen, true)
             }
             KeyCode::Home => self.scroll_strip(-far, false),
             KeyCode::End => self.scroll_strip(far, false),
@@ -704,12 +727,16 @@ impl ReaderScreen {
         }
     }
 
-    /// Scrolls the strip and saves the position when it reaches another page. Going further
-    /// down at the end offers the next chapter when `prompt_at_end` is set.
-    fn scroll_strip(&mut self, delta: i64, prompt_at_end: bool) -> Option<Action> {
+    /// Scrolls the strip and saves the position when it reaches another page. Going on past
+    /// either end offers the next or previous chapter when `prompt` is set.
+    fn scroll_strip(&mut self, delta: i64, prompt: bool) -> Option<Action> {
         if !self.reading.scroll_strip(delta) {
-            if delta > 0 && prompt_at_end && self.reading.strip_position().is_some() {
-                self.end_prompt = true;
+            if prompt && self.reading.strip_position().is_some() {
+                self.prompt = Some(if delta > 0 {
+                    Prompt::Next
+                } else {
+                    Prompt::Previous
+                });
             } else {
                 return None;
             }
@@ -755,7 +782,17 @@ impl ReaderScreen {
         if self.reading.view + 1 < self.reading.views.len() {
             self.go_to(self.reading.view + 1)
         } else {
-            self.end_prompt = self.reading.error.is_none();
+            self.prompt = self.reading.error.is_none().then_some(Prompt::Next);
+            None
+        }
+    }
+
+    /// The previous view, or the start-of-chapter prompt before the first one.
+    fn previous_view(&mut self) -> Option<Action> {
+        if self.reading.view > 0 {
+            self.go_to(self.reading.view - 1)
+        } else {
+            self.prompt = self.reading.error.is_none().then_some(Prompt::Previous);
             None
         }
     }
@@ -772,11 +809,21 @@ impl ReaderScreen {
         self.reading.progress_action()
     }
 
-    fn next_chapter(&self) -> Option<Action> {
-        let next = self.reading.chapter + 1;
-        (next < self.reading.manga.chapters.len()).then(|| Action::OpenReader {
+    /// The chapter `prompt` offers, unless there's none that way.
+    fn offered(&self, prompt: Prompt) -> Option<usize> {
+        let chapter = match prompt {
+            Prompt::Previous => self.reading.chapter.checked_sub(1)?,
+            Prompt::Next => self.reading.chapter + 1,
+        };
+        (chapter < self.reading.manga.chapters.len()).then_some(chapter)
+    }
+
+    fn open_offered(&self, prompt: Prompt) -> Option<Action> {
+        Some(Action::OpenReader {
             manga: self.reading.manga.clone(),
-            chapter: next,
+            chapter: self.offered(prompt)?,
+            // Going back carries on from the previous chapter's last page.
+            at_end: prompt == Prompt::Previous,
         })
     }
 
@@ -811,8 +858,8 @@ impl ReaderScreen {
             }
         }
         self.render_status(frame, status);
-        if self.end_prompt {
-            self.render_end_prompt(frame, image_area);
+        if let Some(prompt) = self.prompt {
+            self.render_prompt(frame, image_area, prompt);
         }
     }
 
@@ -879,18 +926,36 @@ impl ReaderScreen {
         frame.render_widget(Paragraph::new(hints).right_aligned(), right);
     }
 
-    fn render_end_prompt(&self, frame: &mut Frame, area: Rect) {
-        let next = self.reading.manga.chapters.get(self.reading.chapter + 1);
-        let text = match next {
-            Some(next) => Text::from(vec![
-                Line::from("End of chapter".bold()),
-                Line::from(format!("Next: {}", next.name)),
+    fn render_prompt(&self, frame: &mut Frame, area: Rect, prompt: Prompt) {
+        let (heading, title, label, read, none) = match prompt {
+            Prompt::Previous => (
+                "Start of chapter",
+                " Start ",
+                "Previous",
+                "read previous chapter",
+                "This is the first downloaded chapter.",
+            ),
+            Prompt::Next => (
+                "End of chapter",
+                " Done ",
+                "Next",
+                "read next chapter",
+                "This is the last downloaded chapter.",
+            ),
+        };
+        let offered = self
+            .offered(prompt)
+            .map(|chapter| &self.reading.manga.chapters[chapter]);
+        let text = match offered {
+            Some(chapter) => Text::from(vec![
+                Line::from(heading.bold()),
+                Line::from(format!("{label}: {}", chapter.name)),
                 Line::default(),
-                key_hints(&[("Enter", "read next chapter"), ("Esc", "stay")]),
+                key_hints(&[("Enter", read), ("Esc", "stay")]),
             ]),
             None => Text::from(vec![
-                Line::from("End of chapter".bold()),
-                Line::from("This is the last downloaded chapter.".dark_gray()),
+                Line::from(heading.bold()),
+                Line::from(none.dark_gray()),
                 Line::default(),
                 key_hints(&[("Esc", "stay")]),
             ]),
@@ -899,7 +964,7 @@ impl ReaderScreen {
         let popup = centered(area, width, 6);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(text).centered().block(panel(" Done ", true)),
+            Paragraph::new(text).centered().block(panel(title, true)),
             popup,
         );
     }
@@ -982,6 +1047,7 @@ mod tests {
         ReaderScreen::new(
             manga(dir),
             0,
+            false,
             state,
             &graphics(kitty),
             PageLayout::Single,
@@ -1008,11 +1074,74 @@ mod tests {
 
         // Past the last page the reader offers the next chapter instead of moving on.
         assert!(reader.handle_key(key(KeyCode::Right)).is_none());
-        assert!(reader.end_prompt);
+        assert_eq!(reader.prompt, Some(Prompt::Next));
         match reader.handle_key(key(KeyCode::Enter)) {
-            Some(Action::OpenReader { chapter, .. }) => assert_eq!(chapter, 1),
+            Some(Action::OpenReader {
+                chapter: 1,
+                at_end: false,
+                ..
+            }) => {}
             other => panic!("expected the next chapter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn before_the_first_page_offers_the_previous_chapter_at_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        let mut draw = |reader: &mut ReaderScreen| {
+            terminal
+                .draw(|frame| reader.render(frame, frame.area()))
+                .unwrap();
+            crate::ui::buffer_text(&terminal)
+        };
+
+        let (mut first, _) = open(dir.path(), &state, None);
+        assert!(first.handle_key(key(KeyCode::Left)).is_none());
+        assert_eq!(first.prompt, Some(Prompt::Previous));
+        let text = draw(&mut first);
+        assert!(text.contains("Start of chapter"), "{text}");
+        assert!(text.contains("This is the first downloaded chapter."));
+        assert!(first.handle_key(key(KeyCode::Enter)).is_none());
+        assert_eq!(first.prompt, None);
+
+        let (mut second, _) = ReaderScreen::new(
+            manga(dir.path()),
+            1,
+            false,
+            &state,
+            &graphics(None),
+            PageLayout::Single,
+            Fit::Page,
+        );
+        second.handle_key(key(KeyCode::Left));
+        let text = draw(&mut second);
+        assert!(text.contains("Previous: A"), "{text}");
+        assert!(text.contains("Enter read previous chapter"));
+        let (manga, chapter) = match second.handle_key(key(KeyCode::Enter)) {
+            Some(Action::OpenReader {
+                manga,
+                chapter,
+                at_end: true,
+            }) => (manga, chapter),
+            other => panic!("expected the previous chapter at its end, got {other:?}"),
+        };
+        assert_eq!(chapter, 0);
+
+        // It opens on the last page, which counts as reading it.
+        let (reader, action) = ReaderScreen::new(
+            manga,
+            chapter,
+            true,
+            &state,
+            &graphics(None),
+            PageLayout::Single,
+            Fit::Page,
+        );
+        assert_eq!(reader.reading.view, 4);
+        assert_eq!(progress(action), (4, true));
     }
 
     #[test]
@@ -1124,6 +1253,7 @@ mod tests {
         let (reader, _) = ReaderScreen::new(
             strip_manga(dir),
             0,
+            false,
             state,
             &graphics(None),
             PageLayout::Single,
@@ -1216,6 +1346,19 @@ mod tests {
         );
         assert!(reader.handle_mouse(wheel(MouseEventKind::Moved)).is_none());
         assert_eq!(reader.reading.view, 1);
+
+        // Up past the first page offers the previous chapter; more of the same keeps the
+        // popup up, the other way closes it.
+        reader.wheel_turn = None;
+        reader.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        reader.wheel_turn = None;
+        reader.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(reader.prompt, Some(Prompt::Previous));
+        reader.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(reader.prompt, Some(Prompt::Previous));
+        reader.wheel_turn = None;
+        reader.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!((reader.prompt, reader.reading.view), (None, 1));
     }
 
     #[test]
